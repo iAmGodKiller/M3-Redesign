@@ -1,0 +1,91 @@
+name: Build & Release M3-Redesign
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version tag (e.g. v1.0.0). Leave blank to use default."
+        required: false
+        default: "v1.0.0"
+      morphe_ref:
+        description: "Upstream MorpheApp/morphe-patches branch or tag to compile against"
+        required: false
+        default: "main"
+      publish_release:
+        description: "Create/update a GitHub Release with the built .mpp bundle"
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Standalone .mpp Bundle
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout M3-Redesign
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Determine build version and Morphe ref
+        id: meta
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+            SHOULD_RELEASE="true"
+          elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            VERSION="${{ inputs.version }}"
+            [[ -z "$VERSION" ]] && VERSION="v1.0.0"
+            SHOULD_RELEASE="${{ inputs.publish_release }}"
+          else
+            VERSION="dev-${GITHUB_SHA::7}"
+            SHOULD_RELEASE="false"
+          fi
+          MORPHE_REF="${{ inputs.morphe_ref }}"
+          [[ -z "$MORPHE_REF" ]] && MORPHE_REF="main"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "morphe_ref=$MORPHE_REF" >> "$GITHUB_OUTPUT"
+          echo "should_release=$SHOULD_RELEASE" >> "$GITHUB_OUTPUT"
+
+      - name: Build M3-Redesign .mpp
+        shell: bash
+        env:
+          BUILD_VERSION: ${{ steps.meta.outputs.version }}
+          MORPHE_REF: ${{ steps.meta.outputs.morphe_ref }}
+        run: |
+          chmod +x scripts/build-local.sh
+          ./scripts/build-local.sh
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: M3-Redesign-${{ steps.meta.outputs.version }}
+          path: |
+            dist/*.mpp
+            dist/patches-list.json
+
+      - name: Publish GitHub Release
+        if: steps.meta.outputs.should_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.version }}
+          name: M3-Redesign ${{ steps.meta.outputs.version }}
+          generate_release_notes: true
+          files: |
+            dist/*.mpp
+            dist/patches-list.json
