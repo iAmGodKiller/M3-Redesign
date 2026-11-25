@@ -35,9 +35,9 @@ mkdir -p \
   "$WORK_DIR/patches/src/main/kotlin/app/morphe/patches/music/layout/miniplayer/m3navigation" \
   "$WORK_DIR/patches/src/main/resources"
 
-cp -r "$ROOT_DIR/extensions/music/src/main/java/app/morphe/extension/music/patches/miniplayer/." \
+cp -r "$ROOT_DIR/extension/." \
   "$WORK_DIR/extensions/music/src/main/java/app/morphe/extension/music/patches/miniplayer/"
-cp -r "$ROOT_DIR/patches/src/main/kotlin/app/morphe/patches/music/layout/miniplayer/m3navigation/." \
+cp -r "$ROOT_DIR/patch/." \
   "$WORK_DIR/patches/src/main/kotlin/app/morphe/patches/music/layout/miniplayer/m3navigation/"
 
 cp "$ROOT_DIR/build-config/extensions-music-build.gradle.kts" "$WORK_DIR/extensions/music/build.gradle.kts"

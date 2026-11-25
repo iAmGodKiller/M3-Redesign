@@ -18,6 +18,8 @@ local.properties
 *.log
 .DS_Store
 Thumbs.db
+__pycache__/
+*.py[cod]
 
 # AI Studio internal metadata (keep out of public GitHub commits)
 metadata.json

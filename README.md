@@ -89,11 +89,13 @@ The standalone bundle and patch list will be generated in `dist/`:
 M3-Redesign/
 ├── .github/workflows/build-and-release.yml   # Automated CI build & GitHub Release workflow
 ├── build-config/                             # Standalone Gradle & ProGuard overlays
-├── extensions/                               # Java runtime extension (M3NavigationFilter & M3NavigationPreference)
-├── patches/                                  # Kotlin Morphe patch & bytecode fingerprints
+├── extension/                                # Java runtime extension (M3NavigationFilter & M3NavigationPreference)
+├── patch/                                    # Kotlin Morphe patch & bytecode fingerprints
 ├── scripts/
 │   ├── build-local.sh                        # One-command local build script
 │   └── audit-mpp.py                          # Bundle manifest & metadata privacy checker
+├── patches-bundle.json                       # Remote patch source manifest for Morphe Manager
+├── patches-list.json                         # Generated patch catalog
 ├── LICENSE
 └── README.md
 ```
