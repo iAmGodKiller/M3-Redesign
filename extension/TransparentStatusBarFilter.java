@@ -6,10 +6,10 @@ import android.content.Context;
 import android.content.ContextWrapper;
 import android.content.res.Resources;
 import android.graphics.Color;
+import android.graphics.Insets;
+import android.graphics.Rect;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
-import android.graphics.drawable.GradientDrawable;
-import android.graphics.drawable.LayerDrawable;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.SystemClock;
@@ -37,6 +37,7 @@ import androidx.annotation.Nullable;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
@@ -45,11 +46,10 @@ import java.util.WeakHashMap;
 
 /**
  * Standalone runtime hook for the "Transparent status bar" patch.
- * Removes system and app-level status bar layers (DecorView statusBarBackground,
- * CoordinatorLayout/DrawerLayout statusBarBackground, AppBarLayout statusBarForeground,
- * CollapsingToolbarLayout scrims, root fitsSystemWindows top insets, and opaque top-bar
- * backdrops) so vertical content scrolls edge-to-edge all the way to y = 0 behind
- * the system status bar icons while keeping icons untouched.
+ * Strips top status-bar & cutout WindowInsets at android.R.id.content (while keeping
+ * navigation bar & IME insets intact), clears system/app/canvas status bar layers
+ * (R8-safe), makes AppBarLayout scroll 100% past y = 0, and extends vertical scrollers
+ * edge-to-edge behind the status bar icons while keeping icons untouched.
  */
 @SuppressWarnings({"unused", "deprecation"})
 public final class TransparentStatusBarFilter {
@@ -64,7 +64,10 @@ public final class TransparentStatusBarFilter {
 
     private static final Set<View> hookedDecorViews =
             Collections.newSetFromMap(new WeakHashMap<>());
+    private static final Set<View> hookedContentInsetViews =
+            Collections.newSetFromMap(new WeakHashMap<>());
     private static final Map<Window, Long> lastInsetsApplyMs = new WeakHashMap<>();
+    private static final Map<View, Integer> realStatusBarHeightByDecor = new WeakHashMap<>();
 
     // Enforced every frame in OnPreDrawListener so YT Music scroll/theme animations cannot re-darken them
     private static final Set<View> suppressedTopScrims =
@@ -78,8 +81,6 @@ public final class TransparentStatusBarFilter {
     private static final Set<View> paddedHeaders =
             Collections.newSetFromMap(new WeakHashMap<>());
     private static final Set<View> paddedPlayerPages =
-            Collections.newSetFromMap(new WeakHashMap<>());
-    private static final Set<View> rootTopInsetRemovedForDecor =
             Collections.newSetFromMap(new WeakHashMap<>());
 
     // Tracks vertical scrollers extended behind the status bar: [appliedShiftPx, expectedPadTop]
@@ -168,6 +169,7 @@ public final class TransparentStatusBarFilter {
         if (decorView == null) return;
 
         ensureIdsResolved(activity);
+        installZeroTopInsetsInterceptor(decorView);
         applyWindowEdgeToEdge(window, decorView, true);
 
         if (!hookedDecorViews.add(decorView)) {
@@ -197,10 +199,80 @@ public final class TransparentStatusBarFilter {
 
         decorView.post(() -> {
             try {
+                installZeroTopInsetsInterceptor(decorView);
                 applyWindowEdgeToEdge(window, decorView, true);
                 syncTransparentStatusBar(activity, window, decorView, true);
             } catch (Throwable ignored) {}
         });
+    }
+
+    /**
+     * Installs an OnApplyWindowInsetsListener on android.R.id.content that strips top status-bar
+     * and display-cutout insets to 0 before dispatching downward to WatchWhileLayout, CoordinatorLayout,
+     * AppBarLayout, CollapsingToolbarLayout, and YouTube Music's custom status-bar inset views.
+     * Navigation bar and IME (keyboard) insets are preserved 100% untouched.
+     */
+    private static void installZeroTopInsetsInterceptor(View decorView) {
+        View contentView = decorView.findViewById(android.R.id.content);
+        if (contentView == null) return;
+        if (!hookedContentInsetViews.add(contentView)) return;
+
+        contentView.setFitsSystemWindows(false);
+        contentView.setOnApplyWindowInsetsListener((v, insets) -> {
+            if (insets == null) return null;
+            int topH = extractStatusBarTopFromInsets(insets);
+            if (topH > 0) {
+                realStatusBarHeightByDecor.put(decorView, topH);
+            }
+            WindowInsets zeroTop = stripTopSystemBarInsets(insets);
+            return v.onApplyWindowInsets(zeroTop);
+        });
+
+        if (contentView.isAttachedToWindow()) {
+            contentView.requestApplyInsets();
+        }
+    }
+
+    private static int extractStatusBarTopFromInsets(WindowInsets insets) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            int sb = insets.getInsetsIgnoringVisibility(WindowInsets.Type.statusBars()).top;
+            int dc = insets.getInsetsIgnoringVisibility(WindowInsets.Type.displayCutout()).top;
+            int top = Math.max(sb, dc);
+            if (top > 0) return top;
+            return insets.getInsets(WindowInsets.Type.statusBars()).top;
+        }
+        return insets.getSystemWindowInsetTop();
+    }
+
+    private static WindowInsets stripTopSystemBarInsets(WindowInsets insets) {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                Insets sb = insets.getInsets(WindowInsets.Type.statusBars());
+                Insets sbIgn = insets.getInsetsIgnoringVisibility(WindowInsets.Type.statusBars());
+                Insets dc = insets.getInsets(WindowInsets.Type.displayCutout());
+                Insets dcIgn = insets.getInsetsIgnoringVisibility(WindowInsets.Type.displayCutout());
+                Insets mand = insets.getInsets(WindowInsets.Type.mandatorySystemGestures());
+                Insets tappable = insets.getInsets(WindowInsets.Type.tappableElement());
+
+                return new WindowInsets.Builder(insets)
+                        .setInsets(WindowInsets.Type.statusBars(), Insets.of(sb.left, 0, sb.right, sb.bottom))
+                        .setInsetsIgnoringVisibility(WindowInsets.Type.statusBars(), Insets.of(sbIgn.left, 0, sbIgn.right, sbIgn.bottom))
+                        .setInsets(WindowInsets.Type.displayCutout(), Insets.of(dc.left, 0, dc.right, dc.bottom))
+                        .setInsetsIgnoringVisibility(WindowInsets.Type.displayCutout(), Insets.of(dcIgn.left, 0, dcIgn.right, dcIgn.bottom))
+                        .setInsets(WindowInsets.Type.mandatorySystemGestures(), Insets.of(mand.left, 0, mand.right, mand.bottom))
+                        .setInsets(WindowInsets.Type.tappableElement(), Insets.of(tappable.left, 0, tappable.right, tappable.bottom))
+                        .setDisplayCutout(null)
+                        .build();
+            }
+            return insets.replaceSystemWindowInsets(
+                    insets.getSystemWindowInsetLeft(),
+                    0,
+                    insets.getSystemWindowInsetRight(),
+                    insets.getSystemWindowInsetBottom()
+            );
+        } catch (Throwable ignored) {
+            return insets;
+        }
     }
 
     private static void applyWindowEdgeToEdge(Window window, View decorView, boolean forceInsets) {
@@ -217,8 +289,20 @@ public final class TransparentStatusBarFilter {
                     int desiredCutout = (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R)
                             ? WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
                             : WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+                    boolean attrsChanged = false;
                     if (wlp.layoutInDisplayCutoutMode != desiredCutout) {
                         wlp.layoutInDisplayCutoutMode = desiredCutout;
+                        attrsChanged = true;
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        int fitTypes = wlp.getFitInsetsTypes();
+                        int nextFitTypes = fitTypes & ~WindowInsets.Type.statusBars();
+                        if (nextFitTypes != fitTypes) {
+                            wlp.setFitInsetsTypes(nextFitTypes);
+                            attrsChanged = true;
+                        }
+                    }
+                    if (attrsChanged) {
                         window.setAttributes(wlp);
                     }
                 }
@@ -262,7 +346,6 @@ public final class TransparentStatusBarFilter {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                         window.setDecorFitsSystemWindows(false);
                     }
-                    // Keep LAYOUT_STABLE | LAYOUT_FULLSCREEN (without hiding status bar icons)
                     int flags = decorView.getSystemUiVisibility();
                     int want = flags
                             | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
@@ -286,6 +369,7 @@ public final class TransparentStatusBarFilter {
         }
 
         // Fast per-frame enforcement (runs before every draw)
+        installZeroTopInsetsInterceptor(decorView);
         applyWindowEdgeToEdge(window, decorView, false);
         suppressDecorStatusBarOverlays(decorView);
         enforceTrackedViewsPerFrame();
@@ -314,26 +398,22 @@ public final class TransparentStatusBarFilter {
         View playerPage = (playerPageId != 0) ? decorView.findViewById(playerPageId) : null;
         View pivotBar = (pivotBarId != 0) ? decorView.findViewById(pivotBarId) : null;
 
-        // 1. Remove top-inset padding/margins on root structural containers (mContentRoot -> content -> WatchWhileLayout -> browseContent)
-        boolean clearedRootTopInset = clearRootContainerTopInsets(decorView, playerPage, pivotBar, statusBarH);
-        if (clearedRootTopInset) {
-            rootTopInsetRemovedForDecor.add(decorView);
-        }
-        boolean rootInsetWasRemoved = rootTopInsetRemovedForDecor.contains(decorView);
+        // 1. Clear top-inset padding/margins on root structural containers (mContentRoot -> content -> WatchWhileLayout -> browseContent)
+        clearRootContainerTopInsets(decorView, playerPage, pivotBar, statusBarH);
 
-        // If we pulled WatchWhileLayout/root up from y = statusBarH to y = 0, keep Now Playing's top controls below the cutout
-        if (rootInsetWasRemoved && playerPage instanceof ViewGroup ppVg) {
+        // 2. Preserve Now Playing's top controls safe area below the camera cutout while keeping its background full-bleed
+        if (playerPage instanceof ViewGroup ppVg) {
             preservePlayerPageTopSafeArea(ppVg, decorTop, statusBarH);
         }
 
-        // 2. Clear all app-level status bar scrims, canvas-drawn statusBarBackground/Foreground layers,
-        //    opaque top bar backgrounds, and make AppBarLayouts fully scrollable to y = 0
+        // 3. Clear all app-level status bar scrims, R8-safe canvas statusBarBackground/Foreground fields,
+        //    opaque top bar backgrounds, and make AppBarLayouts scroll 100% past y = 0
         suppressTopStatusBarLayersRecursive(
                 decorView, decorView, playerPage, pivotBar,
-                screenW, decorTop, statusBarH, rootInsetWasRemoved, false, 0
+                screenW, decorTop, statusBarH, false, 0
         );
 
-        // 3. Extend all full-page vertical scrollers to y = 0 behind the status bar icons
+        // 4. Extend all full-page vertical scrollers all the way to y = 0 behind the status bar icons
         makeScrollablesEdgeToEdgeTopRecursive(
                 decorView, decorView, playerPage, pivotBar,
                 screenW, screenH, decorTop, statusBarH, 0
@@ -347,7 +427,7 @@ public final class TransparentStatusBarFilter {
         }
         if (!(decorView instanceof ViewGroup dvg)) return;
         int statusBarH = getStatusBarHeight(decorView);
-        int maxGuardH = statusBarH + Math.round(dpToPx(24f));
+        int maxGuardH = statusBarH + Math.round(dpToPx(28f));
         View contentView = decorView.findViewById(android.R.id.content);
         for (int i = 0; i < dvg.getChildCount(); i++) {
             View child = dvg.getChildAt(i);
@@ -411,88 +491,56 @@ public final class TransparentStatusBarFilter {
         }
     }
 
-    /**
-     * Strips top status-bar inset padding/margins from DecorView's mContentRoot, android.R.id.content,
-     * intermediate wrappers, WatchWhileLayout, and the primary browse pane container so app content
-     * begins at y = 0 instead of leaving a solid black strip behind the status bar.
-     */
-    private static boolean clearRootContainerTopInsets(
+    private static void clearRootContainerTopInsets(
             View decorView, @Nullable View playerPage, @Nullable View pivotBar, int statusBarH
     ) {
-        boolean removedAny = false;
         int maxInsetTol = statusBarH + Math.round(dpToPx(18f));
 
-        // 1. DecorView's content root (LinearLayout) & android.R.id.content
         View contentView = decorView.findViewById(android.R.id.content);
         if (contentView != null) {
             View cur = contentView;
             int hops = 0;
             while (cur != null && cur != decorView && hops < 6) {
-                if (clearTopInsetOnContainer(cur, maxInsetTol)) {
-                    removedAny = true;
-                }
-                if (cur instanceof ViewGroup vg) {
-                    if (vg.getClipToPadding()) vg.setClipToPadding(false);
-                    if (vg.getClipChildren()) vg.setClipChildren(false);
-                }
+                clearTopInsetOnContainer(cur, maxInsetTol);
+                unclipContainerAndBounds(cur, false);
                 ViewParent p = cur.getParent();
                 cur = (p instanceof View pv) ? pv : null;
                 hops++;
             }
         }
 
-        // 2. Locate WatchWhileLayout (if present) and clear top insets from android.R.id.content -> WatchWhileLayout -> browse child
         ViewGroup wwl = findWatchWhileLayout(contentView != null ? contentView : decorView, 0);
         if (wwl != null) {
             View cur = wwl;
             int hops = 0;
             while (cur != null && cur != decorView && hops < 10) {
-                if (clearTopInsetOnContainer(cur, maxInsetTol)) {
-                    removedAny = true;
-                }
-                if (cur instanceof ViewGroup vg) {
-                    if (vg.getClipToPadding()) vg.setClipToPadding(false);
-                    if (vg.getClipChildren()) vg.setClipChildren(false);
-                }
+                clearTopInsetOnContainer(cur, maxInsetTol);
+                unclipContainerAndBounds(cur, false);
                 ViewParent p = cur.getParent();
                 cur = (p instanceof View pv) ? pv : null;
                 hops++;
             }
 
-            // Clear top inset on WatchWhileLayout's direct browse content container(s) (never player_page or pivot_bar)
             for (int i = 0; i < wwl.getChildCount(); i++) {
                 View child = wwl.getChildAt(i);
                 if (child == null || child == playerPage || child == pivotBar) continue;
                 if (playerPage != null && isDescendantOf(playerPage, child)) continue;
                 if (child.getClass().getName().contains("M3NavigationFilter$")) continue;
                 if (child.getHeight() >= wwl.getHeight() * 0.55f) {
-                    if (clearTopInsetOnContainer(child, maxInsetTol)) {
-                        removedAny = true;
-                    }
-                    if (child instanceof ViewGroup vg) {
-                        if (vg.getClipToPadding()) vg.setClipToPadding(false);
-                        if (vg.getClipChildren()) vg.setClipChildren(false);
-                    }
+                    clearTopInsetOnContainer(child, maxInsetTol);
+                    unclipContainerAndBounds(child, false);
                 }
             }
         } else if (contentView instanceof ViewGroup contentVg) {
-            // Secondary Activity (e.g., Settings / standalone screen): clear top inset on root layout child
             for (int i = 0; i < contentVg.getChildCount(); i++) {
                 View child = contentVg.getChildAt(i);
                 if (child == null || child.getClass().getName().contains("M3NavigationFilter$")) continue;
                 if (child.getHeight() >= contentVg.getHeight() * 0.55f) {
-                    if (clearTopInsetOnContainer(child, maxInsetTol)) {
-                        removedAny = true;
-                    }
-                    if (child instanceof ViewGroup vg) {
-                        if (vg.getClipToPadding()) vg.setClipToPadding(false);
-                        if (vg.getClipChildren()) vg.setClipChildren(false);
-                    }
+                    clearTopInsetOnContainer(child, maxInsetTol);
+                    unclipContainerAndBounds(child, false);
                 }
             }
         }
-
-        return removedAny;
     }
 
     private static boolean clearTopInsetOnContainer(View view, int maxInsetTol) {
@@ -514,11 +562,27 @@ public final class TransparentStatusBarFilter {
         return changed;
     }
 
+    private static void unclipContainerAndBounds(View view, boolean preserveViewPagerChildrenClip) {
+        Rect clip = view.getClipBounds();
+        if (clip != null && clip.top > 0) {
+            view.setClipBounds(null);
+        }
+        if (view instanceof ViewGroup vg) {
+            if (vg.getClipToPadding()) vg.setClipToPadding(false);
+            if ((!preserveViewPagerChildrenClip || !isSubclassOf(vg.getClass(), "ViewPager"))
+                    && vg.getClipChildren()) {
+                vg.setClipChildren(false);
+            }
+        }
+    }
+
     private static void preservePlayerPageTopSafeArea(ViewGroup playerPage, int decorTop, int statusBarH) {
         if (paddedPlayerPages.contains(playerPage)) return;
         playerPage.getLocationOnScreen(tmpLoc2);
         int ppTop = tmpLoc2[1] - decorTop;
-        if (ppTop <= Math.round(dpToPx(8f)) && playerPage.getPaddingTop() < statusBarH / 2) {
+        // Only pad when Now Playing is expanded to the top of the screen and has no top inset padding
+        if (ppTop <= Math.round(dpToPx(8f)) && playerPage.getHeight() > statusBarH * 4
+                && playerPage.getPaddingTop() < statusBarH / 2) {
             playerPage.setClipToPadding(false);
             playerPage.setPadding(
                     playerPage.getPaddingLeft(),
@@ -564,7 +628,6 @@ public final class TransparentStatusBarFilter {
             int screenW,
             int decorTop,
             int statusBarH,
-            boolean rootInsetWasRemoved,
             boolean insideVerticalScrollable,
             int depth
     ) {
@@ -579,8 +642,7 @@ public final class TransparentStatusBarFilter {
         if (insideVerticalScrollable) return;
         boolean isThisScrollable = (view != decorView) && isVerticalScrollableView(view);
 
-        // 1. Clear canvas-drawn status bar scrims on CoordinatorLayout, DrawerLayout,
-        //    CollapsingToolbarLayout, AppBarLayout, and ScrimInsetsFrameLayout (works on obfuscated subclasses!)
+        // 1. Clear canvas-drawn status bar scrims (both by method name AND by R8-immune Drawable field scan!)
         boolean isAppBar = isSubclassOf(cls, "AppBarLayout");
         boolean isCoordinator = isSubclassOf(cls, "CoordinatorLayout");
         boolean isDrawer = isSubclassOf(cls, "DrawerLayout");
@@ -588,8 +650,11 @@ public final class TransparentStatusBarFilter {
         boolean isScrimInsets = isSubclassOf(cls, "ScrimInsetsFrameLayout");
         boolean isToolbar = isSubclassOf(cls, "Toolbar");
 
-        if (isCoordinator || isDrawer) {
-            clearCanvasStatusBarBackground(view);
+        if (isCoordinator) {
+            clearCanvasStatusBarBackground(view, "CoordinatorLayout");
+        }
+        if (isDrawer) {
+            clearCanvasStatusBarBackground(view, "DrawerLayout");
         }
         if (isCollapsingToolbar) {
             clearCollapsingToolbarScrims(view);
@@ -627,27 +692,25 @@ public final class TransparentStatusBarFilter {
             if (vTop <= statusBarH + Math.round(dpToPx(64f)) && w >= screenW * 0.80f && h > 0) {
                 clearTopBarBackground(view);
                 if (isAppBar && view instanceof ViewGroup appBar) {
-                    makeAppBarFullyScrollable(appBar, decorTop, statusBarH, rootInsetWasRemoved);
-                } else if (rootInsetWasRemoved && (isToolbar || resName.equals("action_bar") || resName.equals("toolbar"))) {
+                    makeAppBarFullyScrollable(appBar, decorTop, statusBarH);
+                } else if (isToolbar || resName.equals("action_bar") || resName.equals("toolbar")) {
                     ensureTopBarSafePadding(view, decorTop, statusBarH);
                 }
             }
         }
 
-        // 3. Suppress dedicated status bar background / scrim strips at y = 0..statusBarH
+        // 3. Suppress dedicated status bar background / scrim / custom-onDraw strips at y = 0..statusBarH
         int w = view.getWidth();
         int h = view.getHeight();
         boolean isLeafOrEmpty = !(view instanceof ViewGroup) || ((ViewGroup) view).getChildCount() == 0;
-        boolean isNonInteractiveOverlay = !(view instanceof TextView)
+        boolean isNonContentOverlay = !(view instanceof TextView)
                 && !(view instanceof EditText)
                 && !(view instanceof Button)
                 && !(view instanceof ProgressBar)
                 && !(view instanceof SurfaceView)
-                && !(view instanceof TextureView)
-                && !view.isClickable()
-                && !view.isFocusable();
+                && !(view instanceof TextureView);
 
-        if (isLeafOrEmpty && isNonInteractiveOverlay && w >= screenW * 0.80f && h > 0) {
+        if (isLeafOrEmpty && isNonContentOverlay && w >= screenW * 0.80f && h > 0) {
             if (isStatusBarNamed && h <= statusBarH + Math.round(dpToPx(24f))) {
                 suppressScrimView(view);
                 return;
@@ -658,24 +721,23 @@ public final class TransparentStatusBarFilter {
                 int vTop = tmpLoc2[1] - decorTop;
                 int vBottom = vTop + h;
                 if (vTop <= Math.round(dpToPx(8f)) && vBottom <= statusBarH + Math.round(dpToPx(20f))) {
-                    boolean hasVisualLayer = (view.getBackground() != null && view.getAlpha() > 0.01f)
-                            || (view instanceof ImageView iv && iv.getDrawable() != null && view.getAlpha() > 0.01f);
-                    if (hasVisualLayer) {
-                        suppressScrimView(view);
-                        return;
-                    }
+                    // Suppress even if getBackground() == null (custom onDraw() black status bar) or clickable (tap-to-top)
+                    suppressScrimView(view);
+                    return;
                 }
             }
         }
 
-        // 4. Clear opaque/dark backgrounds on ANY full-width top header/strip ViewGroup overlapping the status bar area
-        //    (keeps full-screen page backgrounds & Home ambient gradients untouched because h <= statusBarH + 140dp)
+        // 4. Clear ANY non-transparent Drawable background/foreground on full-width top header ViewGroups
+        //    overlapping the status bar area (handles R8-obfuscated MaterialShapeDrawable/StateListDrawable too;
+        //    leaves full-screen page backgrounds & Home ambient gradients untouched because h <= statusBarH + 140dp).
         if (!isThisScrollable && view instanceof ViewGroup && view != decorView
                 && view.getId() != android.R.id.content
-                && w >= screenW * 0.88f
+                && w >= screenW * 0.85f
                 && h > 0 && h <= statusBarH + Math.round(dpToPx(140f))) {
             Drawable bg = view.getBackground();
-            if (isStatusBarNamed || isOpaqueOrDarkTopBarDrawable(bg) || view.getForeground() != null) {
+            boolean hasVisibleBg = (bg != null) && (!(bg instanceof ColorDrawable cd) || Color.alpha(cd.getColor()) > 0);
+            if (isStatusBarNamed || hasVisibleBg || view.getForeground() != null) {
                 view.getLocationOnScreen(tmpLoc2);
                 int vTop = tmpLoc2[1] - decorTop;
                 if (vTop <= statusBarH + Math.round(dpToPx(12f))) {
@@ -688,19 +750,10 @@ public final class TransparentStatusBarFilter {
             for (int i = 0; i < vg.getChildCount(); i++) {
                 suppressTopStatusBarLayersRecursive(
                         vg.getChildAt(i), decorView, playerPage, pivotBar,
-                        screenW, decorTop, statusBarH, rootInsetWasRemoved, false, depth + 1
+                        screenW, decorTop, statusBarH, false, depth + 1
                 );
             }
         }
-    }
-
-    private static boolean isOpaqueOrDarkTopBarDrawable(@Nullable Drawable bg) {
-        if (bg == null) return false;
-        if (bg instanceof ColorDrawable cd) {
-            return Color.alpha(cd.getColor()) > 12;
-        }
-        return (bg instanceof GradientDrawable || bg instanceof LayerDrawable)
-                || bg.getClass().getSimpleName().contains("MaterialShapeDrawable");
     }
 
     private static void clearTopBarBackground(View view) {
@@ -722,9 +775,13 @@ public final class TransparentStatusBarFilter {
         }
     }
 
-    private static void clearCanvasStatusBarBackground(View view) {
+    private static void clearCanvasStatusBarBackground(View view, String targetClassNeedle) {
         invokeNoThrow(view, "setStatusBarBackground", new Class<?>[]{Drawable.class}, new Object[]{null});
         invokeNoThrow(view, "setStatusBarBackgroundColor", new Class<?>[]{int.class}, new Object[]{Color.TRANSPARENT});
+        // R8-safe fallback: null out Drawable field(s) declared directly on CoordinatorLayout (its only Drawable field is mStatusBarBackground)
+        if ("CoordinatorLayout".equals(targetClassNeedle)) {
+            nullDeclaredDrawableFields(view, "CoordinatorLayout");
+        }
     }
 
     private static void clearCollapsingToolbarScrims(View view) {
@@ -732,59 +789,70 @@ public final class TransparentStatusBarFilter {
         invokeNoThrow(view, "setStatusBarScrim", new Class<?>[]{Drawable.class}, new Object[]{null});
         invokeNoThrow(view, "setContentScrimColor", new Class<?>[]{int.class}, new Object[]{Color.TRANSPARENT});
         invokeNoThrow(view, "setContentScrim", new Class<?>[]{Drawable.class}, new Object[]{null});
+        // R8-safe fallback: CollapsingToolbarLayout's only Drawable fields are contentScrim & statusBarScrim
+        nullDeclaredDrawableFields(view, "CollapsingToolbarLayout");
     }
 
     private static void clearScrimInsetsTopForeground(View view) {
         invokeNoThrow(view, "setDrawTopInsetForeground", new Class<?>[]{boolean.class}, new Object[]{false});
+        nullDeclaredDrawableFields(view, "ScrimInsetsFrameLayout");
+    }
+
+    /**
+     * Nulls out any non-static Drawable field declared directly on the specified class in the
+     * view's hierarchy. Survives R8 field renaming because Drawable is an Android framework type.
+     */
+    private static void nullDeclaredDrawableFields(View view, String classNeedle) {
+        try {
+            for (Class<?> c = view.getClass(); c != null && c != ViewGroup.class && c != View.class; c = c.getSuperclass()) {
+                if (c.getName().contains(classNeedle)) {
+                    for (Field f : c.getDeclaredFields()) {
+                        if (!Modifier.isStatic(f.getModifiers()) && f.getType() == Drawable.class) {
+                            f.setAccessible(true);
+                            if (f.get(view) != null) {
+                                f.set(view, null);
+                                view.invalidate();
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        } catch (Throwable ignored) {}
     }
 
     /**
      * Makes an AppBarLayout completely transparent (including Material's canvas-drawn
-     * statusBarForeground & liftOnScroll surface) and able to scroll 100% off-screen past y = 0
+     * statusBarForeground & liftOnScroll surface, R8-safe) and able to scroll 100% past y = 0
      * so its sibling RecyclerView glides all the way to y = 0 behind the status bar icons.
      */
-    private static void makeAppBarFullyScrollable(
-            ViewGroup appBar, int decorTop, int statusBarH, boolean rootInsetWasRemoved
-    ) {
+    private static void makeAppBarFullyScrollable(ViewGroup appBar, int decorTop, int statusBarH) {
         clearTopBarBackground(appBar);
-        // Clear Material AppBarLayout's canvas-drawn statusBarForeground & liftOnScroll tint
         invokeNoThrow(appBar, "setStatusBarForeground", new Class<?>[]{Drawable.class}, new Object[]{null});
         invokeNoThrow(appBar, "setStatusBarForegroundColor", new Class<?>[]{int.class}, new Object[]{Color.TRANSPARENT});
         invokeNoThrow(appBar, "setLiftOnScroll", new Class<?>[]{boolean.class}, new Object[]{false});
         invokeNoThrow(appBar, "setLifted", new Class<?>[]{boolean.class}, new Object[]{false});
-
-        if (appBar.getClipToPadding()) appBar.setClipToPadding(false);
-        if (appBar.getClipChildren()) appBar.setClipChildren(false);
+        // R8-safe fallback: AppBarLayout's only Drawable field is statusBarForeground
+        nullDeclaredDrawableFields(appBar, "AppBarLayout");
+        unclipContainerAndBounds(appBar, false);
 
         // Move AppBarLayout's own paddingTop into its first visible child so totalScrollRange covers 100% of height
         int abPadTop = appBar.getPaddingTop();
         if (abPadTop > 0) {
-            View firstVisible = null;
-            for (int i = 0; i < appBar.getChildCount(); i++) {
-                View c = appBar.getChildAt(i);
-                if (c != null && c.getVisibility() == View.VISIBLE) {
-                    firstVisible = c;
-                    break;
-                }
-            }
+            View firstVisible = findFirstVisibleChild(appBar);
             appBar.setFitsSystemWindows(false);
             appBar.setPadding(appBar.getPaddingLeft(), 0, appBar.getPaddingRight(), appBar.getPaddingBottom());
             if (firstVisible != null && firstVisible.getLayoutParams() instanceof ViewGroup.MarginLayoutParams mlp) {
                 mlp.topMargin += abPadTop;
                 firstVisible.setLayoutParams(mlp);
             }
-        } else if (rootInsetWasRemoved && !adjustedAppBars.contains(appBar)) {
+        } else if (!adjustedAppBars.contains(appBar)) {
+            // Because we stripped top insets at android.R.id.content, keep resting Toolbar icons below the status bar
+            // via topMargin on the first scrollable child (which scrolls completely off-screen past y = 0!).
             appBar.getLocationOnScreen(tmpLoc2);
             int abTop = tmpLoc2[1] - decorTop;
             if (abTop <= Math.round(dpToPx(8f))) {
-                View firstVisible = null;
-                for (int i = 0; i < appBar.getChildCount(); i++) {
-                    View c = appBar.getChildAt(i);
-                    if (c != null && c.getVisibility() == View.VISIBLE) {
-                        firstVisible = c;
-                        break;
-                    }
-                }
+                View firstVisible = findFirstVisibleChild(appBar);
                 if (firstVisible != null) {
                     firstVisible.getLocationOnScreen(tmpLoc2);
                     int fcTop = tmpLoc2[1] - decorTop;
@@ -800,7 +868,7 @@ public final class TransparentStatusBarFilter {
         }
         adjustedAppBars.add(appBar);
 
-        // Ensure EVERY child of AppBarLayout can scroll completely above y = 0 (no pinned minHeight or unscrollable spacer)
+        // Ensure EVERY child of AppBarLayout can scroll completely above y = 0 (R8-safe scrollFlags update)
         for (int i = 0; i < appBar.getChildCount(); i++) {
             View child = appBar.getChildAt(i);
             if (child == null) continue;
@@ -816,23 +884,58 @@ public final class TransparentStatusBarFilter {
             if (child.getMinimumHeight() > 0) {
                 child.setMinimumHeight(0);
             }
-            ViewGroup.LayoutParams lp = child.getLayoutParams();
-            if (lp != null && isSubclassOf(lp.getClass(), "AppBarLayout$LayoutParams")) {
-                try {
-                    Method getFlags = lp.getClass().getMethod("getScrollFlags");
-                    Method setFlags = lp.getClass().getMethod("setScrollFlags", int.class);
-                    Object curObj = getFlags.invoke(lp);
-                    if (curObj instanceof Integer cur) {
-                        // SCROLL_FLAG_SCROLL = 1, EXIT_UNTIL_COLLAPSED = 2, ENTER_ALWAYS = 4
-                        int next = (cur == 0) ? (1 | 4) : ((cur | 1) & ~2);
-                        if (next != cur) {
-                            setFlags.invoke(lp, next);
-                            child.setLayoutParams(lp);
+            ensureAppBarChildScrollFlags(child);
+        }
+    }
+
+    @Nullable
+    private static View findFirstVisibleChild(ViewGroup vg) {
+        for (int i = 0; i < vg.getChildCount(); i++) {
+            View c = vg.getChildAt(i);
+            if (c != null && c.getVisibility() == View.VISIBLE) return c;
+        }
+        return null;
+    }
+
+    private static void ensureAppBarChildScrollFlags(View child) {
+        ViewGroup.LayoutParams lp = child.getLayoutParams();
+        if (lp == null || !isSubclassOf(lp.getClass(), "AppBarLayout$LayoutParams")) return;
+        // 1. Try un-obfuscated getter/setter first
+        try {
+            Method getFlags = lp.getClass().getMethod("getScrollFlags");
+            Method setFlags = lp.getClass().getMethod("setScrollFlags", int.class);
+            Object curObj = getFlags.invoke(lp);
+            if (curObj instanceof Integer cur) {
+                // SCROLL_FLAG_SCROLL = 1, EXIT_UNTIL_COLLAPSED = 2, ENTER_ALWAYS = 4
+                int next = (cur == 0) ? (1 | 4) : ((cur | 1) & ~2);
+                if (next != cur) {
+                    setFlags.invoke(lp, next);
+                    child.setLayoutParams(lp);
+                }
+                return;
+            }
+        } catch (Throwable ignored) {}
+
+        // 2. R8-safe fallback: AppBarLayout$LayoutParams declares a single non-static int field (scrollFlags)
+        try {
+            for (Class<?> c = lp.getClass(); c != null && c != ViewGroup.MarginLayoutParams.class; c = c.getSuperclass()) {
+                if (c.getName().contains("AppBarLayout$LayoutParams")) {
+                    for (Field f : c.getDeclaredFields()) {
+                        if (!Modifier.isStatic(f.getModifiers()) && f.getType() == int.class) {
+                            f.setAccessible(true);
+                            int cur = f.getInt(lp);
+                            int next = (cur == 0) ? (1 | 4) : ((cur | 1) & ~2);
+                            if (next != cur) {
+                                f.setInt(lp, next);
+                                child.setLayoutParams(lp);
+                            }
+                            return;
                         }
                     }
-                } catch (Throwable ignored) {}
+                    break;
+                }
             }
-        }
+        } catch (Throwable ignored) {}
     }
 
     private static void ensureTopBarSafePadding(View topBar, int decorTop, int statusBarH) {
@@ -883,7 +986,6 @@ public final class TransparentStatusBarFilter {
         if (view != decorView && isVerticalScrollableView(view)) {
             int w = view.getWidth();
             int h = view.getHeight();
-            // Adjust full-page vertical scrollers (skip horizontal carousels, chip bars, and small sub-lists)
             if (w >= screenW * 0.85f && h >= screenH * 0.35f) {
                 view.getLocationOnScreen(tmpLoc2);
                 int rvScreenTop = tmpLoc2[1] - decorTop;
@@ -916,10 +1018,7 @@ public final class TransparentStatusBarFilter {
             int decorTop,
             int statusBarH
     ) {
-        if (scrollable instanceof ViewGroup vg) {
-            if (vg.getClipToPadding()) vg.setClipToPadding(false);
-            if (vg.getClipChildren()) vg.setClipChildren(false);
-        }
+        unclipContainerAndBounds(scrollable, false);
 
         View coordinatorChild = findCoordinatorScrollingChild(scrollable);
         ViewGroup siblingAppBar = null;
@@ -933,19 +1032,13 @@ public final class TransparentStatusBarFilter {
                 && siblingAppBar.getHeight() > 0);
 
         // Unclip ancestor chain all the way to DecorView AND clear any status-bar top inset padding/margin
-        // on full-screen intermediate wrappers (e.g. fragment roots / browse containers) that would trap content at y = statusBarH.
         int maxInsetTol = statusBarH + Math.round(dpToPx(18f));
         int clearedAncestorTopPx = 0;
         ViewParent p = scrollable.getParent();
         int hops = 0;
         while (p instanceof ViewGroup ancestor && hops < 18) {
             if (ancestor == playerPage) break;
-            if (ancestor.getClipToPadding()) {
-                ancestor.setClipToPadding(false);
-            }
-            if (!isSubclassOf(ancestor.getClass(), "ViewPager") && ancestor.getClipChildren()) {
-                ancestor.setClipChildren(false);
-            }
+            unclipContainerAndBounds(ancestor, true);
             if (ancestor != decorView
                     && ancestor.getWidth() >= screenW * 0.90f
                     && ancestor.getHeight() >= screenH * 0.55f) {
@@ -953,7 +1046,6 @@ public final class TransparentStatusBarFilter {
                 int prevMargin = (ancestor.getLayoutParams() instanceof ViewGroup.MarginLayoutParams mlp)
                         ? mlp.topMargin : 0;
                 if (clearTopInsetOnContainer(ancestor, maxInsetTol)) {
-                    rootTopInsetRemovedForDecor.add(decorView);
                     if (prevPad > 0 && prevPad <= maxInsetTol) clearedAncestorTopPx += prevPad;
                     if (prevMargin > 0 && prevMargin <= maxInsetTol) clearedAncestorTopPx += prevMargin;
                 }
@@ -963,13 +1055,13 @@ public final class TransparentStatusBarFilter {
             hops++;
         }
 
-        // Case 1: CoordinatorLayout + AppBarLayout.ScrollingViewBehavior
+        // Case 1: CoordinatorLayout + AppBarLayout
         if (hasActiveAppBar && coord != null) {
-            clearCanvasStatusBarBackground(coord);
+            clearCanvasStatusBarBackground(coord, "CoordinatorLayout");
             if (coord.getPaddingTop() > 0) {
                 coord.setPadding(coord.getPaddingLeft(), 0, coord.getPaddingRight(), coord.getPaddingBottom());
             }
-            makeAppBarFullyScrollable(siblingAppBar, decorTop, statusBarH, rootTopInsetRemovedForDecor.contains(decorView));
+            makeAppBarFullyScrollable(siblingAppBar, decorTop, statusBarH);
             if (!scrollable.isNestedScrollingEnabled()) {
                 scrollable.setNestedScrollingEnabled(true);
             }
@@ -979,8 +1071,6 @@ public final class TransparentStatusBarFilter {
         // Case 2: Non-AppBar vertical scroller
         int[] state = adjustedScrollables.get(scrollable);
         if (state == null) {
-            // If we just cleared an ancestor top inset (moving scrollable up by clearedAncestorTopPx),
-            // transfer that inset to scrollable.paddingTop so resting items stay cleanly below the status bar.
             int remainingTop = Math.max(0, rvScreenTop - clearedAncestorTopPx);
             int totalPadAdd = clearedAncestorTopPx;
 
@@ -1002,7 +1092,6 @@ public final class TransparentStatusBarFilter {
                 adjustedScrollables.put(scrollable, new int[]{totalPadAdd, newPadTop});
             }
         } else {
-            // Re-enforce paddingTop if YouTube Music resets padding after a refresh or tab switch
             int shift = state[0];
             int expectedPadTop = state[1];
             int currentPadTop = scrollable.getPaddingTop();
@@ -1021,10 +1110,6 @@ public final class TransparentStatusBarFilter {
         }
     }
 
-    /**
-     * Walks up from scrollable through transparent wrappers (SwipeRefreshLayout, single-child FrameLayout)
-     * that share the exact same screen top so we shift the right layout child up to y = 0.
-     */
     private static View resolveShiftTarget(View scrollable, int decorTop, int rvScreenTop) {
         View target = scrollable;
         int hops = 0;
@@ -1055,7 +1140,6 @@ public final class TransparentStatusBarFilter {
         ViewParent parent = target.getParent();
         if (!(parent instanceof ViewGroup parentVg)) return false;
 
-        // 1. RelativeLayout with BELOW rule: replace BELOW with ALIGN_PARENT_TOP so it starts at top
         if (parentVg instanceof RelativeLayout && lp instanceof RelativeLayout.LayoutParams rlp) {
             int belowId = rlp.getRule(RelativeLayout.BELOW);
             if (belowId != 0) {
@@ -1067,15 +1151,14 @@ public final class TransparentStatusBarFilter {
             }
         }
 
-        // 2. ConstraintLayout with topToBottom constraint: re-anchor topToTop = PARENT_ID (0)
         if (isSubclassOf(parentVg.getClass(), "ConstraintLayout")) {
             try {
                 Field topToBottomF = lp.getClass().getField("topToBottom");
                 Field topToTopF = lp.getClass().getField("topToTop");
                 int curTopToBottom = topToBottomF.getInt(lp);
                 if (curTopToBottom != -1) {
-                    topToBottomF.setInt(lp, -1); // ConstraintLayout.LayoutParams.UNSET
-                    topToTopF.setInt(lp, 0);     // ConstraintLayout.LayoutParams.PARENT_ID
+                    topToBottomF.setInt(lp, -1);
+                    topToTopF.setInt(lp, 0);
                     mlp.topMargin = 0;
                     target.setLayoutParams(lp);
                     return true;
@@ -1083,12 +1166,15 @@ public final class TransparentStatusBarFilter {
             } catch (Throwable ignored) {}
         }
 
-        // 3. FrameLayout / LinearLayout / CoordinatorLayout (without ScrollingViewBehavior) / generic MarginLayoutParams
         mlp.topMargin -= shiftPx;
         target.setLayoutParams(mlp);
         return true;
     }
 
+    /**
+     * Finds the direct CoordinatorLayout child wrapping {@code view} that has an AppBarLayout
+     * ScrollingViewBehavior (works both with un-obfuscated getBehavior() and R8-obfuscated fields).
+     */
     @Nullable
     private static View findCoordinatorScrollingChild(View view) {
         View cur = view;
@@ -1098,19 +1184,41 @@ public final class TransparentStatusBarFilter {
             if (p instanceof ViewGroup pg && isSubclassOf(pg.getClass(), "CoordinatorLayout")) {
                 ViewGroup.LayoutParams lp = cur.getLayoutParams();
                 if (lp != null && isSubclassOf(lp.getClass(), "CoordinatorLayout$LayoutParams")) {
-                    try {
-                        Method getBehavior = lp.getClass().getMethod("getBehavior");
-                        Object behavior = getBehavior.invoke(lp);
-                        if (behavior != null && isSubclassOf(behavior.getClass(), "ScrollingViewBehavior")) {
-                            return cur;
-                        }
-                    } catch (Throwable ignored) {}
+                    Object behavior = extractCoordinatorBehavior(lp);
+                    if (behavior != null && isSubclassOf(behavior.getClass(), "ScrollingViewBehavior")) {
+                        return cur;
+                    }
+                    // If R8 obfuscated ScrollingViewBehavior's class name too, check if CoordinatorLayout has an AppBarLayout sibling
+                    if (behavior != null && findDirectChildSubclass(pg, "AppBarLayout") != null) {
+                        return cur;
+                    }
                 }
                 return null;
             }
             cur = (p instanceof View pv) ? pv : null;
             hops++;
         }
+        return null;
+    }
+
+    @Nullable
+    private static Object extractCoordinatorBehavior(ViewGroup.LayoutParams lp) {
+        try {
+            Method getBehavior = lp.getClass().getMethod("getBehavior");
+            return getBehavior.invoke(lp);
+        } catch (Throwable ignored) {}
+        // R8-safe fallback: scan CoordinatorLayout$LayoutParams fields for a CoordinatorLayout$Behavior subclass
+        try {
+            for (Class<?> c = lp.getClass(); c != null && c != ViewGroup.MarginLayoutParams.class; c = c.getSuperclass()) {
+                for (Field f : c.getDeclaredFields()) {
+                    if (!Modifier.isStatic(f.getModifiers()) && isSubclassOf(f.getType(), "CoordinatorLayout$Behavior")) {
+                        f.setAccessible(true);
+                        Object val = f.get(lp);
+                        if (val != null) return val;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
         return null;
     }
 
@@ -1131,17 +1239,12 @@ public final class TransparentStatusBarFilter {
         if (isSubclassOf(cls, "RecyclerView") || isSubclassOf(cls, "NestedScrollView")) {
             return true;
         }
-        // Fallback for obfuscated vertical scroll containers (excluding horizontal pagers)
         if (view instanceof ViewGroup && !isSubclassOf(cls, "ViewPager")) {
             return view.canScrollVertically(1) || view.canScrollVertically(-1);
         }
         return false;
     }
 
-    /**
-     * Checks whether {@code cls} or any of its superclasses has a name containing {@code needle}.
-     * Handles R8-obfuscated YouTube Music subclasses cleanly with per-class caching.
-     */
     private static boolean isSubclassOf(Class<?> cls, String needle) {
         Map<String, Boolean> map = classHierarchyCache.get(cls);
         if (map != null) {
@@ -1179,19 +1282,20 @@ public final class TransparentStatusBarFilter {
         return false;
     }
 
-    private static int getStatusBarHeight(View view) {
-        WindowInsets insets = view.getRootWindowInsets();
+    private static int getStatusBarHeight(View decorView) {
+        Integer saved = realStatusBarHeightByDecor.get(decorView);
+        if (saved != null && saved > 0) return saved;
+
+        WindowInsets insets = decorView.getRootWindowInsets();
         if (insets != null) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                int top = insets.getInsets(WindowInsets.Type.statusBars()).top;
-                if (top > 0) return top;
-            } else {
-                int top = insets.getSystemWindowInsetTop();
-                if (top > 0) return top;
+            int top = extractStatusBarTopFromInsets(insets);
+            if (top > 0) {
+                realStatusBarHeightByDecor.put(decorView, top);
+                return top;
             }
         }
         try {
-            Resources res = view.getResources();
+            Resources res = decorView.getResources();
             int resId = res.getIdentifier("status_bar_height", "dimen", "android");
             if (resId > 0) {
                 return res.getDimensionPixelSize(resId);
