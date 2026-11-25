@@ -273,6 +273,9 @@ public final class M3NavigationFilter {
     private static float lastSetArtScale = Float.NaN;
     private static float restArtScaleRatio = 1f;
     private static boolean hasRestArtScale = false;
+    @Nullable private static ViewOutlineProvider origArtOutlineProvider = null;
+    private static boolean origArtClipToOutline = false;
+    private static WeakReference<View> origArtOutlineTargetRef = new WeakReference<>(null);
 
     // Now Playing ambient mode album-art sampler state
     private static final int AMBIENT_SAMPLE_SIZE = 32;
@@ -385,6 +388,22 @@ public final class M3NavigationFilter {
         prefSearchRotationSec = SEARCH_ROTATION_SEC.get();
         prefBlurRadiusDp = BLUR_RADIUS_DP.get();
         prefAmbientIntensityPct = AMBIENT_INTENSITY_PCT.get();
+
+        if (!prefAmbientMode) {
+            NowPlayingAmbientView existingAmbient = ambientViewRef.get();
+            if (existingAmbient != null) {
+                existingAmbient.setVisibility(View.GONE);
+                if (existingAmbient.getParent() instanceof ViewGroup parent) {
+                    parent.removeView(existingAmbient);
+                }
+                ambientViewRef = new WeakReference<>(null);
+            }
+        } else {
+            NowPlayingAmbientView existingAmbient = ambientViewRef.get();
+            if (existingAmbient != null) {
+                existingAmbient.invalidate();
+            }
+        }
 
         if (prefEnabled) {
             enforceOfficialHarmonySettings(context, false);
@@ -1682,7 +1701,8 @@ public final class M3NavigationFilter {
             int cropT = (artH > minSide) ? (artH - minSide) / 2 : 0;
             int cropR = cropL + minSide;
             int cropB = cropT + minSide;
-            float visualCornerPx = Math.max(dpToPx(6f), Math.min(dpToPx(10f), artSize * 0.20f));
+            // Match the miniplayer capsule layer radius (INNER_CORNER_DP) so art and capsule feel coherent
+            float visualCornerPx = dpToPx(INNER_CORNER_DP);
 
             if (collapseRatio >= 0.99f && !isPlayerParkedEmpty) {
                 float targetMinScale = (minSide > 0)
@@ -1711,14 +1731,7 @@ public final class M3NavigationFilter {
 
                 if (minSide > 0) {
                     float localCornerPx = visualCornerPx / Math.max(0.25f, targetMinScale);
-                    artOutlineProvider.set(cropL, cropT, cropR, cropB, localCornerPx);
-                    if (artContainer.getOutlineProvider() != artOutlineProvider) {
-                        artContainer.setOutlineProvider(artOutlineProvider);
-                    }
-                    if (!artContainer.getClipToOutline()) {
-                        artContainer.setClipToOutline(true);
-                    }
-                    artContainer.invalidateOutline();
+                    applyMiniArtOutline(artContainer, cropL, cropT, cropR, cropB, localCornerPx);
                 }
             } else if (collapseRatio > 0.004f && !isPlayerParkedEmpty) {
                 float appliedScale = lastRawArtScale;
@@ -1743,18 +1756,10 @@ public final class M3NavigationFilter {
                     int ct = Math.round(lerp(0f, cropT, collapseRatio));
                     int cr = Math.round(lerp(artW, cropR, collapseRatio));
                     int cb = Math.round(lerp(artH, cropB, collapseRatio));
-                    float localCornerPx = lerp(0f, visualCornerPx, collapseRatio) / Math.max(0.25f, appliedScale);
-                    artOutlineProvider.set(cl, ct, cr, cb, localCornerPx);
-                    if (artContainer.getOutlineProvider() != artOutlineProvider) {
-                        artContainer.setOutlineProvider(artOutlineProvider);
-                    }
-                    if (!artContainer.getClipToOutline()) {
-                        artContainer.setClipToOutline(true);
-                    }
-                    artContainer.invalidateOutline();
-                } else if (artContainer.getOutlineProvider() == artOutlineProvider) {
-                    artContainer.setClipToOutline(false);
-                    artContainer.setOutlineProvider(ViewOutlineProvider.BACKGROUND);
+                    float localCornerPx = visualCornerPx / Math.max(0.25f, appliedScale);
+                    applyMiniArtOutline(artContainer, cl, ct, cr, cb, localCornerPx);
+                } else {
+                    restoreArtOutline(artContainer);
                 }
             } else {
                 if (!Float.isNaN(lastSetArtScale)) {
@@ -1765,11 +1770,38 @@ public final class M3NavigationFilter {
                 }
                 lastSetArtTx = Float.NaN;
                 lastSetArtTy = Float.NaN;
-                if (artContainer.getOutlineProvider() == artOutlineProvider) {
-                    artContainer.setClipToOutline(false);
-                    artContainer.setOutlineProvider(ViewOutlineProvider.BACKGROUND);
-                }
+                restoreArtOutline(artContainer);
             }
+        }
+    }
+
+    private static void applyMiniArtOutline(View artContainer, int l, int t, int r, int b, float localCornerPx) {
+        ViewOutlineProvider current = artContainer.getOutlineProvider();
+        if (current != artOutlineProvider) {
+            origArtOutlineTargetRef = new WeakReference<>(artContainer);
+            origArtOutlineProvider = current;
+            origArtClipToOutline = artContainer.getClipToOutline();
+            artContainer.setOutlineProvider(artOutlineProvider);
+        }
+        artOutlineProvider.set(l, t, r, b, localCornerPx);
+        if (!artContainer.getClipToOutline()) {
+            artContainer.setClipToOutline(true);
+        }
+        artContainer.invalidateOutline();
+    }
+
+    // Restores YouTube Music's original Now Playing album-art outline provider and clipping state.
+    private static void restoreArtOutline(@Nullable View artContainer) {
+        if (artContainer == null) return;
+        if (artContainer.getOutlineProvider() == artOutlineProvider) {
+            if (origArtOutlineTargetRef.get() == artContainer && origArtOutlineProvider != null) {
+                artContainer.setOutlineProvider(origArtOutlineProvider);
+                artContainer.setClipToOutline(origArtClipToOutline);
+            } else {
+                artContainer.setOutlineProvider(ViewOutlineProvider.BACKGROUND);
+                artContainer.setClipToOutline(false);
+            }
+            artContainer.invalidateOutline();
         }
     }
 
@@ -1909,8 +1941,7 @@ public final class M3NavigationFilter {
                 artContainer.setAlpha(1f);
                 artContainer.setScaleX(1f);
                 artContainer.setScaleY(1f);
-                artContainer.setClipToOutline(false);
-                artContainer.setOutlineProvider(ViewOutlineProvider.BACKGROUND);
+                restoreArtOutline(artContainer);
             }
         }
 

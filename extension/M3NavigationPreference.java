@@ -249,12 +249,6 @@ public class M3NavigationPreference extends Preference {
                 }));
 
         m3DependentPrefs.add(addSwitch(context, generalCat,
-                M3NavigationFilter.AMBIENT_MODE,
-                "Now Playing ambient mode",
-                "Show a soft living ambient glow behind the Now Playing screen based on the album art",
-                checked -> refreshAvailability.run()));
-
-        m3DependentPrefs.add(addSwitch(context, generalCat,
                 M3NavigationFilter.REPLACE_LIB_ACTION,
                 "Swap Library with + / Shuffle in Library",
                 "Replace the Library icon with New Playlist (+) or Shuffle while viewing Library",
@@ -265,6 +259,25 @@ public class M3NavigationPreference extends Preference {
                 "Hide playlist floating Play button",
                 "Hide the redundant floating Play button inside playlists",
                 null));
+
+        // Category 1b: Now Playing Ambient Mode (live-applied without restart)
+        PreferenceCategory ambientCat = new PreferenceCategory(context);
+        ambientCat.setTitle("Now Playing ambient mode");
+        screen.addPreference(ambientCat);
+
+        m3DependentPrefs.add(addSwitch(context, ambientCat,
+                M3NavigationFilter.AMBIENT_MODE,
+                "Enable ambient mode",
+                "Show a soft living album-art glow behind the Now Playing screen (turn off for default background)",
+                checked -> refreshAvailability.run(),
+                false));
+
+        Preference ambientIntensityPref = addSliderPreference(context, ambientCat,
+                M3NavigationFilter.AMBIENT_INTENSITY_PCT,
+                "Ambient glow intensity",
+                25, 100, "%", false);
+        ambientIntensityPrefHolder[0] = ambientIntensityPref;
+        m3DependentPrefs.add(ambientIntensityPref);
 
         // Category 2: Wavy Search Button
         PreferenceCategory searchCat = new PreferenceCategory(context);
@@ -342,13 +355,6 @@ public class M3NavigationPreference extends Preference {
                 M3NavigationFilter.BLUR_RADIUS_DP,
                 "Background blur radius (0 = off)",
                 0, 40, "dp"));
-
-        Preference ambientIntensityPref = addSliderPreference(context, sizeCat,
-                M3NavigationFilter.AMBIENT_INTENSITY_PCT,
-                "Now Playing ambient intensity",
-                25, 100, "%");
-        ambientIntensityPrefHolder[0] = ambientIntensityPref;
-        m3DependentPrefs.add(ambientIntensityPref);
 
         Preference resetPref = new Preference(context);
         resetPref.setKey("morphe_music_m3_navigation_reset");
@@ -542,6 +548,18 @@ public class M3NavigationPreference extends Preference {
             String summary,
             @Nullable final BooleanCallback extraAction
     ) {
+        return addSwitch(context, parent, setting, title, summary, extraAction, true);
+    }
+
+    private static SwitchPreference addSwitch(
+            final Context context,
+            PreferenceGroup parent,
+            final BooleanSetting setting,
+            String title,
+            String summary,
+            @Nullable final BooleanCallback extraAction,
+            final boolean requireRestart
+    ) {
         SwitchPreference sw = new SwitchPreference(context);
         sw.setKey(setting.key);
         sw.setPersistent(false);
@@ -558,7 +576,9 @@ public class M3NavigationPreference extends Preference {
                 setting.save(checked);
                 M3NavigationFilter.syncFromSettings(context);
             }
-            M3NavigationFilter.promptRestart(context);
+            if (requireRestart) {
+                M3NavigationFilter.promptRestart(context);
+            }
             return true;
         });
         parent.addPreference(sw);
@@ -668,6 +688,19 @@ public class M3NavigationPreference extends Preference {
             final int max,
             final String unit
     ) {
+        return addSliderPreference(context, parent, setting, title, min, max, unit, true);
+    }
+
+    private static Preference addSliderPreference(
+            final Context context,
+            PreferenceGroup parent,
+            final IntegerSetting setting,
+            final String title,
+            final int min,
+            final int max,
+            final String unit,
+            final boolean requireRestart
+    ) {
         final Preference pref = new Preference(context);
         pref.setKey(setting.key);
         pref.setPersistent(false);
@@ -681,7 +714,9 @@ public class M3NavigationPreference extends Preference {
                 setting.save(newVal);
                 pref.setSummary(String.format(Locale.US, "%d %s", newVal, unit));
                 M3NavigationFilter.syncFromSettings(context);
-                M3NavigationFilter.promptRestart(context);
+                if (requireRestart) {
+                    M3NavigationFilter.promptRestart(context);
+                }
             });
             return true;
         });
