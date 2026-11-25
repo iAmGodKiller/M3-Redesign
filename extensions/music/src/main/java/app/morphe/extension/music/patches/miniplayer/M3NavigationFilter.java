@@ -394,6 +394,22 @@ public final class M3NavigationFilter {
      * Hooks Morphe's official Setting availability rules so conflicting official toggles
      * are automatically greyed out across all Morphe Settings screens while M3 Redesign is ON.
      */
+    @Nullable
+    private static Setting<?> getOptionalSetting(String fieldName) {
+        try {
+            Field f = Settings.class.getField(fieldName);
+            Object val = f.get(null);
+            if (val instanceof Setting<?> s) return s;
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    @Nullable
+    private static BooleanSetting getOptionalBooleanSetting(String fieldName) {
+        Setting<?> s = getOptionalSetting(fieldName);
+        return (s instanceof BooleanSetting bs) ? bs : null;
+    }
+
     private static void hookOfficialSettingsAvailability() {
         if (officialAvailabilityHooked) return;
         officialAvailabilityHooked = true;
@@ -403,12 +419,12 @@ public final class M3NavigationFilter {
                     Settings.MINIPLAYER_PREVIOUS_BUTTON,
                     Settings.CHANGE_MINIPLAYER_COLOR,
                     Settings.CHANGE_NAVIGATION_BAR_COLOR,
-                    Settings.NAVIGATION_BAR_GLASS,
-                    Settings.NAVIGATION_BAR_GLASS_OPACITY,
-                    Settings.NAVIGATION_BAR_GLASS_LIGHT,
-                    Settings.NAVIGATION_BAR_GLASS_HEIGHT,
-                    Settings.NAVIGATION_BAR_GLASS_WIDTH,
-                    Settings.NAVIGATION_BAR_GLASS_BUTTON_SPACING,
+                    getOptionalSetting("NAVIGATION_BAR_GLASS"),
+                    getOptionalSetting("NAVIGATION_BAR_GLASS_OPACITY"),
+                    getOptionalSetting("NAVIGATION_BAR_GLASS_LIGHT"),
+                    getOptionalSetting("NAVIGATION_BAR_GLASS_HEIGHT"),
+                    getOptionalSetting("NAVIGATION_BAR_GLASS_WIDTH"),
+                    getOptionalSetting("NAVIGATION_BAR_GLASS_BUTTON_SPACING"),
                     Settings.HIDE_NAVIGATION_BAR,
                     Settings.HIDE_NAVIGATION_BAR_HOME_BUTTON,
                     Settings.HIDE_NAVIGATION_BAR_SAMPLES_BUTTON,
@@ -490,25 +506,28 @@ public final class M3NavigationFilter {
 
     private static void enforceOfficialHarmonySettings(@Nullable Context rawContext, boolean createBackupIfNeeded) {
         try {
+            BooleanSetting glassNavSetting = getOptionalBooleanSetting("NAVIGATION_BAR_GLASS");
             Context ctx = resolveAppContext(rawContext);
             if (createBackupIfNeeded && ctx != null) {
                 SharedPreferences sp = ctx.getSharedPreferences(PREFS_HARMONY_BACKUP, Context.MODE_PRIVATE);
                 if (!sp.getBoolean(KEY_BACKUP_ACTIVE, false)) {
-                    sp.edit()
+                    SharedPreferences.Editor editor = sp.edit()
                             .putBoolean(KEY_BACKUP_ACTIVE, true)
                             .putBoolean(Settings.MINIPLAYER_NEXT_BUTTON.key, Settings.MINIPLAYER_NEXT_BUTTON.get())
                             .putBoolean(Settings.MINIPLAYER_PREVIOUS_BUTTON.key, Settings.MINIPLAYER_PREVIOUS_BUTTON.get())
                             .putBoolean(Settings.CHANGE_MINIPLAYER_COLOR.key, Settings.CHANGE_MINIPLAYER_COLOR.get())
                             .putBoolean(Settings.CHANGE_NAVIGATION_BAR_COLOR.key, Settings.CHANGE_NAVIGATION_BAR_COLOR.get())
-                            .putBoolean(Settings.NAVIGATION_BAR_GLASS.key, Settings.NAVIGATION_BAR_GLASS.get())
                             .putBoolean(Settings.HIDE_NAVIGATION_BAR.key, Settings.HIDE_NAVIGATION_BAR.get())
                             .putBoolean(Settings.HIDE_NAVIGATION_BAR_HOME_BUTTON.key, Settings.HIDE_NAVIGATION_BAR_HOME_BUTTON.get())
                             .putBoolean(Settings.HIDE_NAVIGATION_BAR_SAMPLES_BUTTON.key, Settings.HIDE_NAVIGATION_BAR_SAMPLES_BUTTON.get())
                             .putBoolean(Settings.HIDE_NAVIGATION_BAR_EXPLORE_BUTTON.key, Settings.HIDE_NAVIGATION_BAR_EXPLORE_BUTTON.get())
                             .putBoolean(Settings.HIDE_NAVIGATION_BAR_LIBRARY_BUTTON.key, Settings.HIDE_NAVIGATION_BAR_LIBRARY_BUTTON.get())
                             .putBoolean(Settings.HIDE_NAVIGATION_BAR_UPGRADE_BUTTON.key, Settings.HIDE_NAVIGATION_BAR_UPGRADE_BUTTON.get())
-                            .putBoolean(Settings.HIDE_NAVIGATION_BAR_LABEL.key, Settings.HIDE_NAVIGATION_BAR_LABEL.get())
-                            .apply();
+                            .putBoolean(Settings.HIDE_NAVIGATION_BAR_LABEL.key, Settings.HIDE_NAVIGATION_BAR_LABEL.get());
+                    if (glassNavSetting != null) {
+                        editor.putBoolean(glassNavSetting.key, glassNavSetting.get());
+                    }
+                    editor.apply();
                 }
             }
 
@@ -519,7 +538,7 @@ public final class M3NavigationFilter {
             saveIfDifferent(Settings.CHANGE_MINIPLAYER_COLOR, prefDynamicColor);
             saveIfDifferent(Settings.CHANGE_NAVIGATION_BAR_COLOR, false);
             // Disable conflicting official navigation bar modes
-            saveIfDifferent(Settings.NAVIGATION_BAR_GLASS, false);
+            saveIfDifferent(glassNavSetting, false);
             saveIfDifferent(Settings.HIDE_NAVIGATION_BAR, false);
             saveIfDifferent(Settings.HIDE_NAVIGATION_BAR_HOME_BUTTON, false);
             saveIfDifferent(Settings.HIDE_NAVIGATION_BAR_LIBRARY_BUTTON, false);
@@ -541,7 +560,7 @@ public final class M3NavigationFilter {
                     Settings.MINIPLAYER_PREVIOUS_BUTTON,
                     Settings.CHANGE_MINIPLAYER_COLOR,
                     Settings.CHANGE_NAVIGATION_BAR_COLOR,
-                    Settings.NAVIGATION_BAR_GLASS,
+                    getOptionalBooleanSetting("NAVIGATION_BAR_GLASS"),
                     Settings.HIDE_NAVIGATION_BAR,
                     Settings.HIDE_NAVIGATION_BAR_HOME_BUTTON,
                     Settings.HIDE_NAVIGATION_BAR_SAMPLES_BUTTON,
@@ -551,7 +570,7 @@ public final class M3NavigationFilter {
                     Settings.HIDE_NAVIGATION_BAR_LABEL
             };
             for (BooleanSetting s : backedUp) {
-                if (sp.contains(s.key)) {
+                if (s != null && sp.contains(s.key)) {
                     saveIfDifferent(s, sp.getBoolean(s.key, s.defaultValue));
                 }
             }
@@ -559,8 +578,8 @@ public final class M3NavigationFilter {
         } catch (Throwable ignored) {}
     }
 
-    private static void saveIfDifferent(BooleanSetting setting, boolean value) {
-        if (setting.get() != value) {
+    private static void saveIfDifferent(@Nullable BooleanSetting setting, boolean value) {
+        if (setting != null && setting.get() != value) {
             setting.save(value);
         }
     }

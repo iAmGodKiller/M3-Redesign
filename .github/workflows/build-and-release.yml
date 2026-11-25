@@ -18,9 +18,9 @@ on:
         required: false
         default: "v1.0.0"
       morphe_ref:
-        description: "Upstream MorpheApp/morphe-patches branch or tag (leave blank for auto main/dev)"
+        description: "Upstream MorpheApp/morphe-patches branch or tag (main = stable, dev = pre-release)"
         required: false
-        default: ""
+        default: "main"
       publish_release:
         description: "Create/update a GitHub Release and update patches-bundle.json on main"
         type: boolean
