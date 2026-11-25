@@ -3545,28 +3545,28 @@ public final class M3NavigationFilter {
             basePaint.setColor(withAlpha(currBaseColor, Math.round(255f * baseFade)));
             canvas.drawRect(0f, 0f, w, h, basePaint);
 
-            // 2. Softly blurred album art mesh with slow breathing scale & gentle drift
+            // 2. Softly blurred album art mesh centered and oversized to screen diagonal so rotated edges never enter the viewport
             float fadeT = Math.max(0f, Math.min(1f, (now - bitmapChangeMs) / (float) CROSSFADE_MS));
-            float meshScale = 1.24f + 0.07f * (float) Math.sin(t * 0.24);
-            float meshSize = Math.max(w, h) * meshScale;
+            float meshScale = 1.65f + 0.08f * (float) Math.sin(t * 0.24);
+            float meshSize = (float) Math.hypot(w, h) * meshScale;
             float driftX = w * 0.045f * (float) Math.sin(t * 0.19);
             float driftY = h * 0.035f * (float) Math.cos(t * 0.15);
             float cx = w * 0.5f + driftX;
-            float cy = h * 0.40f + driftY;
+            float cy = h * 0.5f + driftY;
             meshRect.set(cx - meshSize * 0.5f, cy - meshSize * 0.5f, cx + meshSize * 0.5f, cy + meshSize * 0.5f);
             float rotDeg = 5.5f * (float) Math.sin(t * 0.13);
             int maxMeshAlpha = Math.round(160f * intensity);
 
             if (prevBitmap != null && !prevBitmap.isRecycled() && fadeT < 0.99f) {
                 int save = canvas.save();
-                canvas.rotate(rotDeg, w * 0.5f, h * 0.42f);
+                canvas.rotate(rotDeg, w * 0.5f, h * 0.5f);
                 meshPaint.setAlpha(Math.round(maxMeshAlpha * (1f - fadeT)));
                 canvas.drawBitmap(prevBitmap, null, meshRect, meshPaint);
                 canvas.restoreToCount(save);
             }
             if (currBitmap != null && !currBitmap.isRecycled()) {
                 int save = canvas.save();
-                canvas.rotate(rotDeg, w * 0.5f, h * 0.42f);
+                canvas.rotate(rotDeg, w * 0.5f, h * 0.5f);
                 meshPaint.setAlpha(Math.round(maxMeshAlpha * fadeT));
                 canvas.drawBitmap(currBitmap, null, meshRect, meshPaint);
                 canvas.restoreToCount(save);
