@@ -16,7 +16,21 @@ internal object M3MiniPlayerConstructorFingerprint : Fingerprint(
         methodCall(
             opcode = Opcode.INVOKE_VIRTUAL,
             name = "findViewById",
-            location = MatchAfterWithin(5)
+            location = MatchAfterWithin(12)
+        ),
+        string("sharedToggleMenuItemMutations")
+    )
+)
+
+// Dedicated attach fingerprint for the standalone Transparent status bar patch
+internal object TransparentStatusBarAttachFingerprint : Fingerprint(
+    name = "<init>",
+    filters = listOf(
+        resourceLiteral(ResourceType.ID, "mini_player_play_pause_replay_button"),
+        methodCall(
+            opcode = Opcode.INVOKE_VIRTUAL,
+            name = "findViewById",
+            location = MatchAfterWithin(12)
         ),
         string("sharedToggleMenuItemMutations")
     )

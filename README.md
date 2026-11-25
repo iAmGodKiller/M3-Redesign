@@ -3,7 +3,9 @@
 A standalone **Material 3 Expressive** navigation bar and miniplayer redesign add-on patch for **YouTube Music**, built for the [Morphe](https://github.com/MorpheApp/morphe-patches) patcher ecosystem.
 
 **Author:** `iAmGodKiller`  
-**Patch Name:** `M3 Redesign addon` *(off by default after patching — enable in Morphe Settings)*
+**Included Patches:**
+- **`M3 Redesign addon`** *(off by default after patching — enable in Morphe Settings)*
+- **`Transparent status bar`** *(standalone opt-in patch — completely transparent status bar with edge-to-edge scrolling behind status bar icons)*
 
 ---
 

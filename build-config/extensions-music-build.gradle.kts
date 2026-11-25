@@ -26,11 +26,13 @@ configure<ApplicationExtension> {
 
 tasks.withType<JavaCompile>().configureEach {
     doLast {
+        // Keep only standalone add-on extension classes in extensions/m3navigation.mpe
         destinationDirectory.get().asFile.walkTopDown()
             .filter { it.isFile && it.extension == "class" }
             .filter {
                 !it.name.startsWith("M3NavigationFilter") &&
-                    !it.name.startsWith("M3NavigationPreference")
+                    !it.name.startsWith("M3NavigationPreference") &&
+                    !it.name.startsWith("TransparentStatusBarFilter")
             }
             .forEach { it.delete() }
     }

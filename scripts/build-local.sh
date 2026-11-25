@@ -93,18 +93,20 @@ for cand in candidates:
     has_root_dex = "classes.dex" in names
     has_ext = "extensions/m3navigation.mpe" in names
     has_patch_cls = any("M3NavigationPatch" in n and n.endswith(".class") for n in names)
+    has_tsb_cls = any("TransparentStatusBarPatch" in n and n.endswith(".class") for n in names)
     print(
         f"Candidate: {cand.name} (size={cand.stat().st_size}, "
-        f"root_classes_dex={has_root_dex}, m3_ext={has_ext}, m3_patch_cls={has_patch_cls})",
+        f"root_classes_dex={has_root_dex}, m3_ext={has_ext}, "
+        f"m3_patch_cls={has_patch_cls}, tsb_patch_cls={has_tsb_cls})",
         file=sys.stderr,
     )
-    if has_root_dex and has_ext and has_patch_cls:
+    if has_root_dex and has_ext and has_patch_cls and has_tsb_cls:
         chosen = cand
         break
 
 if chosen is None:
     raise SystemExit(
-        "ERROR: No built .mpp file contained root classes.dex + M3NavigationPatch classes + extensions/m3navigation.mpe!"
+        "ERROR: Built .mpp missing root classes.dex, M3NavigationPatch, TransparentStatusBarPatch, or extensions/m3navigation.mpe!"
     )
 
 with zipfile.ZipFile(chosen) as zf:
