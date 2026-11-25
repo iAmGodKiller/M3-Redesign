@@ -38,18 +38,18 @@ jobs:
 
     steps:
       - name: Checkout M3-Redesign
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "17"
 
       - name: Cache Gradle packages
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.gradle/caches
@@ -83,7 +83,8 @@ jobs:
       - name: Build M3-Redesign .mpp
         shell: bash
         env:
-          BUILD_VERSION: ${{ steps.meta.outputs.version }}
+          BUILD_VERSION: ${{ steps.meta.outputs.clean_version }}
+          ARTIFACT_VERSION: ${{ steps.meta.outputs.version }}
           MORPHE_REF: ${{ steps.meta.outputs.morphe_ref }}
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -92,14 +93,14 @@ jobs:
           ./scripts/build-local.sh
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: M3-Redesign-${{ steps.meta.outputs.version }}
           path: dist/
 
       - name: Publish GitHub Release
         if: steps.meta.outputs.should_release == 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.meta.outputs.version }}
           name: M3-Redesign ${{ steps.meta.outputs.version }}

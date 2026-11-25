@@ -6,10 +6,10 @@ patches {
     about {
         name = "M3-Redesign"
         description = "Standalone Material 3 Expressive navigation bar and miniplayer redesign add-on for YouTube Music"
-        source = "https://github.com/iAmGodkiller/M3-Redesign"
-        author = "iAmGodkiller"
-        contact = "https://github.com/iAmGodkiller/M3-Redesign/issues"
-        website = "https://github.com/iAmGodkiller/M3-Redesign"
+        source = "https://github.com/iAmGodKiller/M3-Redesign"
+        author = "iAmGodKiller"
+        contact = "https://github.com/iAmGodKiller/M3-Redesign/issues"
+        website = "https://github.com/iAmGodKiller/M3-Redesign"
         license = "GNU General Public License v3.0, with additional GPL section 7 requirements"
     }
 }
@@ -62,6 +62,16 @@ dependencies {
 }
 
 tasks {
+    processResources {
+        exclude(
+            "extensions/youtube.mpe",
+            "extensions/shared-youtube.mpe",
+            "extensions/shared.mpe",
+            "extensions/reddit.mpe",
+            "extensions/all/**"
+        )
+    }
+
     test {
         enabled = false
     }
