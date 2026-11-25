@@ -1,10 +1,10 @@
 {
   "NOTE": "Do NOT manually edit this file. This file is automatically updated when semantic release (release.yml) runs. Manually editing this file can break your releases and break third party tools that use this file.",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "patches": [
     {
       "name": "M3 Redesign addon",
-      "description": "Redesigns the miniplayer, navigation bar, and Now Playing transition into a customizable Material 3 Expressive layout with wave seekbar, rotating wavy search button, and dynamic album palette.",
+      "description": "Redesigns the miniplayer, navigation bar, and Now Playing screen into a customizable Material 3 Expressive layout with wave seekbar, rotating wavy search button, ambient glow, and dynamic album palette.",
       "default": false,
       "category": null,
       "compatiblePackages": [
