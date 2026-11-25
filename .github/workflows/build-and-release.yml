@@ -4,6 +4,11 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - "patches-bundle.json"
+      - "patches-list.json"
+      - "README.md"
+      - "LICENSE"
     tags:
       - "v*"
   workflow_dispatch:
@@ -17,7 +22,7 @@ on:
         required: false
         default: ""
       publish_release:
-        description: "Create/update a GitHub Release with the built .mpp bundle"
+        description: "Create/update a GitHub Release and update patches-bundle.json on main"
         type: boolean
         required: false
         default: true
@@ -34,6 +39,8 @@ jobs:
     steps:
       - name: Checkout M3-Redesign
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -66,8 +73,10 @@ jobs:
             VERSION="v1.0.0-dev.${GITHUB_SHA::7}"
             SHOULD_RELEASE="false"
           fi
+          CLEAN_VERSION="${VERSION#v}"
           MORPHE_REF="${{ inputs.morphe_ref }}"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "clean_version=$CLEAN_VERSION" >> "$GITHUB_OUTPUT"
           echo "morphe_ref=$MORPHE_REF" >> "$GITHUB_OUTPUT"
           echo "should_release=$SHOULD_RELEASE" >> "$GITHUB_OUTPUT"
 
@@ -97,3 +106,47 @@ jobs:
           generate_release_notes: true
           files: |
             dist/*
+
+      - name: Update patches-bundle.json on main for Morphe Manager
+        if: steps.meta.outputs.should_release == 'true'
+        shell: bash
+        env:
+          TAG_VERSION: ${{ steps.meta.outputs.version }}
+          CLEAN_VERSION: ${{ steps.meta.outputs.clean_version }}
+          REPO_SLUG: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          MPP_NAME="$(basename "$(ls dist/*.mpp | head -n 1)")"
+          CREATED_AT="$(date -u +"%Y-%m-%dT%H:%M:%S")"
+          DOWNLOAD_URL="https://github.com/${REPO_SLUG}/releases/download/${TAG_VERSION}/${MPP_NAME}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git checkout -B main origin/main
+
+          python3 - <<'PY' "$CREATED_AT" "$DOWNLOAD_URL" "$CLEAN_VERSION"
+          import json, sys
+          created_at, download_url, version = sys.argv[1:4]
+          bundle = {
+              "created_at": created_at,
+              "description": "Standalone Material 3 Expressive navigation bar and miniplayer redesign add-on for YouTube Music",
+              "download_url": download_url,
+              "signature_download_url": "",
+              "version": version,
+          }
+          with open("patches-bundle.json", "w", encoding="utf-8") as f:
+              json.dump(bundle, f, indent=2)
+              f.write("\n")
+          PY
+
+          if [[ -f dist/patches-list.json ]]; then
+            cp dist/patches-list.json patches-list.json
+          fi
+
+          git add patches-bundle.json
+          [[ -f patches-list.json ]] && git add patches-list.json
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(release): update patches-bundle.json for ${TAG_VERSION} [skip ci]"
+            git push origin main
+          fi

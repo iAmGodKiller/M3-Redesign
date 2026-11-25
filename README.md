@@ -22,12 +22,20 @@ A standalone **Material 3 Expressive** navigation bar and miniplayer redesign ad
 
 ## Installation (Morphe Manager)
 
+### Method 1 — Add as a Remote Patch Source (Recommended)
+1. Open **Morphe Manager** → **Patch Sources** → **Add Source**.
+2. Paste this repository URL:
+   ```text
+   https://github.com/iAmGodkiller/M3-Redesign
+   ```
+   *(Or open via deeplink: `morphe://sources/add?url=https://github.com/iAmGodkiller/M3-Redesign`)*
+3. Keep the official **Morphe** patches source enabled alongside **M3-Redesign**.
+4. Select **M3 Redesign addon** with your usual YouTube Music patches and patch YouTube Music.
+5. Open the patched YouTube Music app → **Settings → Morphe → M3 Redesign addon** → turn on **Enable M3 Redesign addon** and restart.
+
+### Method 2 — Manual `.mpp` File
 1. Download the latest `M3-Redesign-v*.mpp` from the **[Releases](https://github.com/iAmGodkiller/M3-Redesign/releases)** page.
-2. Open **Morphe Manager** and load **both**:
-   - Official Morphe patches (`MorpheApp/morphe-patches`), and
-   - `M3-Redesign-v*.mpp` as an add-on patch bundle.
-3. Select **M3 Redesign addon** alongside your usual YouTube Music patches and patch YouTube Music.
-4. Open the patched YouTube Music app → **Settings → Morphe → M3 Redesign addon** → turn on **Enable M3 Redesign addon** and restart.
+2. In **Morphe Manager**, add the downloaded `.mpp` file alongside the official Morphe patches and patch YouTube Music.
 
 ---
 
