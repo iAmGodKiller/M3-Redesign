@@ -4,8 +4,8 @@ A standalone **Material 3 Expressive** navigation bar and miniplayer redesign ad
 
 **Author:** `iAmGodKiller`  
 **Included Patches:**
-- **`M3 Redesign addon`** *(off by default after patching — enable in Morphe Settings)*
-- **`Transparent status bar`** *(standalone opt-in patch — completely transparent status bar with edge-to-edge scrolling behind status bar icons)*
+- **`M3 Redesign addon`** *(stable — off by default after patching; enable in Morphe Settings)*
+- **`Transparent status bar`** *(pre-release / `dev` channel only — enable **Use pre-releases** in Morphe Manager to test)*
 
 ---
 
@@ -68,19 +68,22 @@ All options live under **Settings → Morphe → M3 Redesign addon**:
 ## Building From Source
 
 ### Option A — GitHub Actions (Recommended)
-1. Push a tag (e.g. `v1.0.0`) or go to the **Actions** tab → **Build & Release M3-Redesign** → **Run workflow**.
-2. GitHub Actions automatically fetches `MorpheApp/morphe-patches`, overlays this clean-room add-on, compiles the standalone `.mpp` + `patches-list.json`, audits the bundle, and publishes a GitHub Release.
+1. **Stable release** (`M3 Redesign addon` only): push a stable tag (e.g. `v3.1.0`) or go to **Actions** → **Build & Release M3-Redesign** → **Run workflow** with `prerelease` unchecked. Updates `patches-bundle.json` on `main`.
+2. **Pre-release** (includes `prerelease/` patches such as `Transparent status bar`): push a pre-release tag (e.g. `v3.1.0-dev.1`) or run the workflow with `prerelease` checked. Publishes a GitHub Pre-release and updates `patches-bundle.json` on the `dev` branch for Morphe Manager's pre-release toggle.
 
 ### Option B — Local Build (Linux / macOS)
 Requirements: **JDK 17**, **Android SDK** (`ANDROID_HOME` set), **Git**, and **Python 3**.
 
 ```bash
 chmod +x scripts/build-local.sh
+# Stable bundle (M3 Redesign addon only):
 ./scripts/build-local.sh
+# Pre-release bundle (includes prerelease/ patches):
+INCLUDE_PRERELEASE=true ./scripts/build-local.sh
 ```
 
 The standalone bundle and patch list will be generated in `dist/`:
-- `dist/M3-Redesign-v1.0.0.mpp`
+- `dist/M3-Redesign-v*.mpp`
 - `dist/patches-list.json`
 
 ---
@@ -89,12 +92,13 @@ The standalone bundle and patch list will be generated in `dist/`:
 
 ```text
 M3-Redesign/
-├── .github/workflows/build-and-release.yml   # Automated CI build & GitHub Release workflow
+├── .github/workflows/build-and-release.yml   # Automated CI build & GitHub Release / Pre-release workflow
 ├── build-config/                             # Standalone Gradle & ProGuard overlays
-├── extension/                                # Java runtime extension (M3NavigationFilter & M3NavigationPreference)
-├── patch/                                    # Kotlin Morphe patch & bytecode fingerprints
+├── extension/                                # Stable Java runtime extension (M3NavigationFilter & M3NavigationPreference)
+├── patch/                                    # Stable Kotlin Morphe patch & bytecode fingerprints
+├── prerelease/                               # Pre-release patches & extensions (e.g. Transparent status bar)
 ├── scripts/
-│   ├── build-local.sh                        # One-command local build script
+│   ├── build-local.sh                        # One-command local build script (stable & pre-release)
 │   └── audit-mpp.py                          # Bundle manifest & metadata privacy checker
 ├── patches-bundle.json                       # Remote patch source manifest for Morphe Manager
 ├── patches-list.json                         # Generated patch catalog

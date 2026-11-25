@@ -8,6 +8,7 @@ MORPHE_REPO="${MORPHE_REPO:-https://github.com/MorpheApp/morphe-patches.git}"
 MORPHE_REF="${MORPHE_REF:-main}"
 BUILD_VERSION="${BUILD_VERSION:-}"
 ARTIFACT_VERSION="${ARTIFACT_VERSION:-}"
+INCLUDE_PRERELEASE="${INCLUDE_PRERELEASE:-false}"
 
 echo "==> Preparing Morphe build workspace ($MORPHE_REPO @ $MORPHE_REF)"
 if [[ ! -d "$WORK_DIR/.git" ]]; then
@@ -39,6 +40,20 @@ cp -r "$ROOT_DIR/extension/." \
   "$WORK_DIR/extensions/music/src/main/java/app/morphe/extension/music/patches/miniplayer/"
 cp -r "$ROOT_DIR/patch/." \
   "$WORK_DIR/patches/src/main/kotlin/app/morphe/patches/music/layout/miniplayer/m3navigation/"
+
+if [[ "$INCLUDE_PRERELEASE" == "true" ]]; then
+  echo "==> Including pre-release patches from prerelease/"
+  if [[ -d "$ROOT_DIR/prerelease/extension" ]]; then
+    cp -r "$ROOT_DIR/prerelease/extension/." \
+      "$WORK_DIR/extensions/music/src/main/java/app/morphe/extension/music/patches/miniplayer/"
+  fi
+  if [[ -d "$ROOT_DIR/prerelease/patch" ]]; then
+    cp -r "$ROOT_DIR/prerelease/patch/." \
+      "$WORK_DIR/patches/src/main/kotlin/app/morphe/patches/music/layout/miniplayer/m3navigation/"
+  fi
+else
+  echo "==> Building stable patches only (pre-release patches excluded)"
+fi
 
 cp "$ROOT_DIR/build-config/extensions-music-build.gradle.kts" "$WORK_DIR/extensions/music/build.gradle.kts"
 cp "$ROOT_DIR/build-config/patches-build.gradle.kts" "$WORK_DIR/patches/build.gradle.kts"
@@ -75,10 +90,11 @@ echo "==> Selecting and verifying Android DEX .mpp bundle"
 rm -rf "$DIST_DIR"
 mkdir -p "$DIST_DIR"
 
-MPP_FILE="$(python3 - <<'PY' "$WORK_DIR/patches/build/libs"
+MPP_FILE="$(python3 - <<'PY' "$WORK_DIR/patches/build/libs" "$INCLUDE_PRERELEASE"
 import pathlib, sys, zipfile
 
 root = pathlib.Path(sys.argv[1])
+include_prerelease = sys.argv[2].lower() == "true"
 candidates = sorted(root.rglob("*.mpp"))
 if not candidates:
     raise SystemExit(f"ERROR: No .mpp files found under {root}")
@@ -94,19 +110,20 @@ for cand in candidates:
     has_ext = "extensions/m3navigation.mpe" in names
     has_patch_cls = any("M3NavigationPatch" in n and n.endswith(".class") for n in names)
     has_tsb_cls = any("TransparentStatusBarPatch" in n and n.endswith(".class") for n in names)
+    tsb_ok = has_tsb_cls if include_prerelease else (not has_tsb_cls)
     print(
         f"Candidate: {cand.name} (size={cand.stat().st_size}, "
         f"root_classes_dex={has_root_dex}, m3_ext={has_ext}, "
-        f"m3_patch_cls={has_patch_cls}, tsb_patch_cls={has_tsb_cls})",
+        f"m3_patch_cls={has_patch_cls}, tsb_patch_cls={has_tsb_cls}, prerelease={include_prerelease})",
         file=sys.stderr,
     )
-    if has_root_dex and has_ext and has_patch_cls and has_tsb_cls:
+    if has_root_dex and has_ext and has_patch_cls and tsb_ok:
         chosen = cand
         break
 
 if chosen is None:
     raise SystemExit(
-        "ERROR: Built .mpp missing root classes.dex, M3NavigationPatch, TransparentStatusBarPatch, or extensions/m3navigation.mpe!"
+        f"ERROR: Built .mpp failed verification (include_prerelease={include_prerelease})!"
     )
 
 with zipfile.ZipFile(chosen) as zf:
