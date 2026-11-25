@@ -10,13 +10,17 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.res.ColorStateList;
 import android.content.res.Resources;
+import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.ColorMatrix;
 import android.graphics.ColorMatrixColorFilter;
+import android.graphics.LinearGradient;
+import android.graphics.Matrix;
 import android.graphics.Outline;
 import android.graphics.Paint;
 import android.graphics.Path;
+import android.graphics.RadialGradient;
 import android.graphics.RecordingCanvas;
 import android.graphics.Rect;
 import android.graphics.RectF;
@@ -104,6 +108,9 @@ public final class M3NavigationFilter {
             new BooleanSetting("morphe_music_m3_navigation_show_wave_seekbar", true);
     public static final BooleanSetting DYNAMIC_COLOR =
             new BooleanSetting("morphe_music_m3_navigation_dynamic_color", true);
+    // Album-art-driven ambient backdrop on the expanded Now Playing screen
+    public static final BooleanSetting AMBIENT_MODE =
+            new BooleanSetting("morphe_music_m3_navigation_ambient_mode", true);
     public static final BooleanSetting ROTATE_SEARCH =
             new BooleanSetting("morphe_music_m3_navigation_rotate_search", true);
     public static final BooleanSetting INVERT_SEARCH =
@@ -134,6 +141,8 @@ public final class M3NavigationFilter {
             new IntegerSetting("morphe_music_m3_navigation_search_rotation_sec", 50);
     public static final IntegerSetting BLUR_RADIUS_DP =
             new IntegerSetting("morphe_music_m3_navigation_blur_radius_dp", 40);
+    public static final IntegerSetting AMBIENT_INTENSITY_PCT =
+            new IntegerSetting("morphe_music_m3_navigation_ambient_intensity_pct", 65);
 
     // Fallback track when no previously played song is stored
     private static final String DEFAULT_FALLBACK_TITLE = "Ek Pal Ka Jeena";
@@ -152,6 +161,7 @@ public final class M3NavigationFilter {
     static boolean prefShowAlbumArt = true;
     static boolean prefShowWaveSeekbar = true;
     static boolean prefDynamicColor = true;
+    static boolean prefAmbientMode = true;
     static boolean prefRotateSearch = true;
     static boolean prefInvertSearch = true;
     static boolean prefReplaceLibAction = true;
@@ -167,6 +177,7 @@ public final class M3NavigationFilter {
     static int prefSearchLobePermille = 30;
     static int prefSearchRotationSec = 50;
     static int prefBlurRadiusDp = 40;
+    static int prefAmbientIntensityPct = 65;
 
     private static boolean officialAvailabilityHooked = false;
     private static final Map<String, Setting<?>> MANAGED_OFFICIAL_SETTINGS = new HashMap<>();
@@ -229,6 +240,7 @@ public final class M3NavigationFilter {
     private static WeakReference<ImageView> stockPlayPauseRef = new WeakReference<>(null);
     private static WeakReference<MiniWaveSeekBarView> waveSeekBarRef = new WeakReference<>(null);
     private static WeakReference<MiniBlurBackdropView> miniBlurViewRef = new WeakReference<>(null);
+    private static WeakReference<NowPlayingAmbientView> ambientViewRef = new WeakReference<>(null);
     private static final Set<View> hiddenNativeFabs = Collections.newSetFromMap(new WeakHashMap<>());
     private static final Set<View> hiddenNativeBars = Collections.newSetFromMap(new WeakHashMap<>());
 
@@ -242,10 +254,11 @@ public final class M3NavigationFilter {
     private static WeakReference<Drawable> searchIconDrawableRef = new WeakReference<>(null);
     private static WeakReference<Drawable> libraryIconDrawableRef = new WeakReference<>(null);
 
-    // WatchWhileLayout "bv" field + idempotent album art alignment state
+    // WatchWhileLayout "bv" field + idempotent album art alignment, scaling & corner-clip state
     @Nullable private static Field wwlBvField = null;
     private static boolean wwlBvInspected = false;
     private static final PlayerPageOutlineProvider playerOutlineProvider = new PlayerPageOutlineProvider();
+    private static final PlayerPageOutlineProvider artOutlineProvider = new PlayerPageOutlineProvider();
     private static boolean nativeMiniStyled = false;
     private static int origMiniHeight = -1;
     private static float restingCollapsedTop = -1f;
@@ -256,6 +269,22 @@ public final class M3NavigationFilter {
     private static float restArtOffsetX = 0f;
     private static float restArtOffsetY = 0f;
     private static boolean hasRestArtOffset = false;
+    private static float lastRawArtScale = 1f;
+    private static float lastSetArtScale = Float.NaN;
+    private static float restArtScaleRatio = 1f;
+    private static boolean hasRestArtScale = false;
+
+    // Now Playing ambient mode album-art sampler state
+    private static final int AMBIENT_SAMPLE_SIZE = 32;
+    @Nullable private static Bitmap ambientScratchBitmap = null;
+    @Nullable private static Canvas ambientScratchCanvas = null;
+    private static final int[] ambientScratchPixels = new int[AMBIENT_SAMPLE_SIZE * AMBIENT_SAMPLE_SIZE];
+    private static final int[] ambientBlurTemp = new int[AMBIENT_SAMPLE_SIZE * AMBIENT_SAMPLE_SIZE];
+    private static final Rect ambientSavedBounds = new Rect();
+    private static long lastAmbientSampleMs = 0L;
+    private static int lastAmbientDrawableSig = 0;
+    private static String lastAmbientTrackKey = "";
+    private static boolean ambientHasBitmapForTrack = false;
 
     // Official ChangeMiniplayerColorPatch + Lyrics reflection hooks (safe if official patch absent)
     @Nullable private static Field lastMiniplayerColorField;
@@ -339,6 +368,7 @@ public final class M3NavigationFilter {
         prefShowAlbumArt = SHOW_ALBUM_ART.get();
         prefShowWaveSeekbar = SHOW_WAVE_SEEKBAR.get();
         prefDynamicColor = DYNAMIC_COLOR.get();
+        prefAmbientMode = AMBIENT_MODE.get();
         prefRotateSearch = ROTATE_SEARCH.get();
         prefInvertSearch = INVERT_SEARCH.get();
         prefReplaceLibAction = REPLACE_LIB_ACTION.get();
@@ -354,6 +384,7 @@ public final class M3NavigationFilter {
         prefSearchLobePermille = SEARCH_LOBE_PERMILLE.get();
         prefSearchRotationSec = SEARCH_ROTATION_SEC.get();
         prefBlurRadiusDp = BLUR_RADIUS_DP.get();
+        prefAmbientIntensityPct = AMBIENT_INTENSITY_PCT.get();
 
         if (prefEnabled) {
             enforceOfficialHarmonySettings(context, false);
@@ -590,6 +621,7 @@ public final class M3NavigationFilter {
         SHOW_ALBUM_ART.resetToDefault();
         SHOW_WAVE_SEEKBAR.resetToDefault();
         DYNAMIC_COLOR.resetToDefault();
+        AMBIENT_MODE.resetToDefault();
         ROTATE_SEARCH.resetToDefault();
         INVERT_SEARCH.resetToDefault();
         REPLACE_LIB_ACTION.resetToDefault();
@@ -604,6 +636,7 @@ public final class M3NavigationFilter {
         SEARCH_LOBE_PERMILLE.resetToDefault();
         SEARCH_ROTATION_SEC.resetToDefault();
         BLUR_RADIUS_DP.resetToDefault();
+        AMBIENT_INTENSITY_PCT.resetToDefault();
         if (wasEnabled && !ENABLED.get()) {
             restoreOfficialHarmonySettings(context);
         }
@@ -1127,7 +1160,7 @@ public final class M3NavigationFilter {
         if (view instanceof ViewGroup vg) {
             for (int i = 0; i < vg.getChildCount(); i++) {
                 View child = vg.getChildAt(i);
-                if (child instanceof MiniBlurBackdropView) continue;
+                if (child instanceof MiniBlurBackdropView || child instanceof NowPlayingAmbientView) continue;
                 int found = extractBackgroundColorFromHierarchy(child, depth + 1);
                 if (found != 0) return found;
             }
@@ -1488,6 +1521,12 @@ public final class M3NavigationFilter {
             }
         }
 
+        View artContainer = (WATCH_FRAGMENT_CONTAINER_ID != 0)
+                ? playerPage.findViewById(WATCH_FRAGMENT_CONTAINER_ID) : null;
+
+        // 3b. Now Playing Ambient Mode layered behind album art & controls when expanded
+        updateNowPlayingAmbient(playerPage, artContainer, overlayH, collapseRatio, isPlayerParkedEmpty, cachedNowPlayingColor);
+
         // 4. Reliably hide ALL native miniplayer progress bars / scrims / dividers (without touching Now Playing's time_bar)
         hideNativeMiniplayerProgressResidue(playerPage, overlayW, pillH);
 
@@ -1511,14 +1550,9 @@ public final class M3NavigationFilter {
         setViewVisibilityById(stockMini, PREV_BTN_ID, View.GONE);
         setViewVisibilityById(stockMini, NEXT_BTN_ID, View.GONE);
 
-        View artContainer = (WATCH_FRAGMENT_CONTAINER_ID != 0)
-                ? playerPage.findViewById(WATCH_FRAGMENT_CONTAINER_ID) : null;
-        int defaultArtInset = Math.round(dpToPx(6f));
-        int defaultArtSize = Math.max(Dim.dp(28), pillHPx - defaultArtInset * 2);
-        int measuredArtW = (artContainer != null && collapseRatio >= 0.98f && artContainer.getWidth() > 0)
-                ? artContainer.getWidth() : defaultArtSize;
-        int artSize = Math.max(Dim.dp(28), Math.min(measuredArtW, pillHPx - Dim.dp(8)));
-        int artInset = Math.max(defaultArtInset, Math.round((pillH - artSize) * 0.5f));
+        // Scale miniplayer album art proportionally with the configured navigation bar height
+        int artInset = Math.max(Dim.dp(5), Math.round(pillH * 0.11f));
+        int artSize = Math.max(Dim.dp(28), pillHPx - artInset * 2);
 
         boolean showArtNow = prefShowAlbumArt || collapseRatio < 0.5f;
         View spacer = (MINI_SPACER_ID != 0) ? stockMini.findViewById(MINI_SPACER_ID) : null;
@@ -1625,38 +1659,116 @@ public final class M3NavigationFilter {
             }
         }
 
-        // 6. Idempotent album art (@id/watch_fragment_container) alignment — never double-shifts!
+        // 6. Idempotent album art (@id/watch_fragment_container) alignment, bar-height scaling & rounded corners
         if (artContainer != null) {
             artContainer.setAlpha(prefShowAlbumArt ? 1f : (1f - collapseRatio));
             float curTx = artContainer.getTranslationX();
             float curTy = artContainer.getTranslationY();
+            float curSx = artContainer.getScaleX();
             if (Float.isNaN(lastSetArtTx) || Math.abs(curTx - lastSetArtTx) > 0.5f) {
                 lastRawArtTx = curTx;
             }
             if (Float.isNaN(lastSetArtTy) || Math.abs(curTy - lastSetArtTy) > 0.5f) {
                 lastRawArtTy = curTy;
             }
+            if (Float.isNaN(lastSetArtScale) || Math.abs(curSx - lastSetArtScale) > 0.005f) {
+                lastRawArtScale = curSx;
+            }
+
+            int artW = artContainer.getWidth();
+            int artH = artContainer.getHeight();
+            int minSide = Math.min(artW, artH);
+            int cropL = (artW > minSide) ? (artW - minSide) / 2 : 0;
+            int cropT = (artH > minSide) ? (artH - minSide) / 2 : 0;
+            int cropR = cropL + minSide;
+            int cropB = cropT + minSide;
+            float visualCornerPx = Math.max(dpToPx(6f), Math.min(dpToPx(10f), artSize * 0.20f));
 
             if (collapseRatio >= 0.99f && !isPlayerParkedEmpty) {
-                float targetMinTx = miniL + artInset;
-                float targetMinTy = Math.max(0f, (pillH - artContainer.getHeight()) * 0.5f);
+                float targetMinScale = (minSide > 0)
+                        ? Math.max(0.45f, Math.min(1.85f, artSize / (float) minSide))
+                        : 1f;
+                restArtScaleRatio = targetMinScale / Math.max(0.05f, lastRawArtScale);
+                hasRestArtScale = true;
+
+                artContainer.setPivotX(0f);
+                artContainer.setPivotY(0f);
+                artContainer.setScaleX(targetMinScale);
+                artContainer.setScaleY(targetMinScale);
+                lastSetArtScale = targetMinScale;
+
+                float visualSide = (minSide > 0) ? (minSide * targetMinScale) : artSize;
+                float targetMinTx = miniL + artInset - cropL * targetMinScale;
+                float targetMinTy = Math.max(0f, (pillH - visualSide) * 0.5f) - cropT * targetMinScale;
                 restArtOffsetX = targetMinTx - lastRawArtTx;
                 restArtOffsetY = targetMinTy - lastRawArtTy;
                 hasRestArtOffset = true;
+
                 artContainer.setTranslationX(targetMinTx);
                 artContainer.setTranslationY(targetMinTy);
                 lastSetArtTx = targetMinTx;
                 lastSetArtTy = targetMinTy;
-            } else if (collapseRatio > 0.004f && !isPlayerParkedEmpty && hasRestArtOffset) {
-                float desiredTx = lastRawArtTx + restArtOffsetX * collapseRatio;
-                float desiredTy = lastRawArtTy + restArtOffsetY * collapseRatio;
-                artContainer.setTranslationX(desiredTx);
-                artContainer.setTranslationY(desiredTy);
-                lastSetArtTx = desiredTx;
-                lastSetArtTy = desiredTy;
+
+                if (minSide > 0) {
+                    float localCornerPx = visualCornerPx / Math.max(0.25f, targetMinScale);
+                    artOutlineProvider.set(cropL, cropT, cropR, cropB, localCornerPx);
+                    if (artContainer.getOutlineProvider() != artOutlineProvider) {
+                        artContainer.setOutlineProvider(artOutlineProvider);
+                    }
+                    if (!artContainer.getClipToOutline()) {
+                        artContainer.setClipToOutline(true);
+                    }
+                    artContainer.invalidateOutline();
+                }
+            } else if (collapseRatio > 0.004f && !isPlayerParkedEmpty) {
+                float appliedScale = lastRawArtScale;
+                if (hasRestArtScale) {
+                    appliedScale = lastRawArtScale * lerp(1f, restArtScaleRatio, collapseRatio);
+                    artContainer.setPivotX(0f);
+                    artContainer.setPivotY(0f);
+                    artContainer.setScaleX(appliedScale);
+                    artContainer.setScaleY(appliedScale);
+                    lastSetArtScale = appliedScale;
+                }
+                if (hasRestArtOffset) {
+                    float desiredTx = lastRawArtTx + restArtOffsetX * collapseRatio;
+                    float desiredTy = lastRawArtTy + restArtOffsetY * collapseRatio;
+                    artContainer.setTranslationX(desiredTx);
+                    artContainer.setTranslationY(desiredTy);
+                    lastSetArtTx = desiredTx;
+                    lastSetArtTy = desiredTy;
+                }
+                if (minSide > 0 && collapseRatio > 0.02f) {
+                    int cl = Math.round(lerp(0f, cropL, collapseRatio));
+                    int ct = Math.round(lerp(0f, cropT, collapseRatio));
+                    int cr = Math.round(lerp(artW, cropR, collapseRatio));
+                    int cb = Math.round(lerp(artH, cropB, collapseRatio));
+                    float localCornerPx = lerp(0f, visualCornerPx, collapseRatio) / Math.max(0.25f, appliedScale);
+                    artOutlineProvider.set(cl, ct, cr, cb, localCornerPx);
+                    if (artContainer.getOutlineProvider() != artOutlineProvider) {
+                        artContainer.setOutlineProvider(artOutlineProvider);
+                    }
+                    if (!artContainer.getClipToOutline()) {
+                        artContainer.setClipToOutline(true);
+                    }
+                    artContainer.invalidateOutline();
+                } else if (artContainer.getOutlineProvider() == artOutlineProvider) {
+                    artContainer.setClipToOutline(false);
+                    artContainer.setOutlineProvider(ViewOutlineProvider.BACKGROUND);
+                }
             } else {
+                if (!Float.isNaN(lastSetArtScale)) {
+                    float restoreScale = Float.isNaN(lastRawArtScale) ? 1f : lastRawArtScale;
+                    artContainer.setScaleX(restoreScale);
+                    artContainer.setScaleY(restoreScale);
+                    lastSetArtScale = Float.NaN;
+                }
                 lastSetArtTx = Float.NaN;
                 lastSetArtTy = Float.NaN;
+                if (artContainer.getOutlineProvider() == artOutlineProvider) {
+                    artContainer.setClipToOutline(false);
+                    artContainer.setOutlineProvider(ViewOutlineProvider.BACKGROUND);
+                }
             }
         }
     }
@@ -1679,7 +1791,9 @@ public final class M3NavigationFilter {
             for (int i = 0; i < topVg.getChildCount(); i++) {
                 View child = topVg.getChildAt(i);
                 if (child == null || child instanceof ViewGroup
-                        || child instanceof MiniWaveSeekBarView || child instanceof MiniBlurBackdropView) {
+                        || child instanceof MiniWaveSeekBarView
+                        || child instanceof MiniBlurBackdropView
+                        || child instanceof NowPlayingAmbientView) {
                     continue;
                 }
                 int cid = child.getId();
@@ -1704,7 +1818,9 @@ public final class M3NavigationFilter {
             View view, View playerPage, int overlayW, int maxBandY, int depth, int maxDepth
     ) {
         if (view == null || depth > maxDepth) return;
-        if (view instanceof MiniWaveSeekBarView || view instanceof MiniBlurBackdropView) return;
+        if (view instanceof MiniWaveSeekBarView
+                || view instanceof MiniBlurBackdropView
+                || view instanceof NowPlayingAmbientView) return;
         int id = view.getId();
         if (id != View.NO_ID && (id == MINI_SPACER_ID || id == WATCH_FRAGMENT_CONTAINER_ID)) return;
 
@@ -1775,6 +1891,9 @@ public final class M3NavigationFilter {
         lastSetArtTx = Float.NaN;
         lastSetArtTy = Float.NaN;
         hasRestArtOffset = false;
+        lastRawArtScale = 1f;
+        lastSetArtScale = Float.NaN;
+        hasRestArtScale = false;
 
         if (playerPage != null) {
             playerPage.setAlpha(1f);
@@ -1786,7 +1905,13 @@ public final class M3NavigationFilter {
             }
             View artContainer = (WATCH_FRAGMENT_CONTAINER_ID != 0)
                     ? playerPage.findViewById(WATCH_FRAGMENT_CONTAINER_ID) : null;
-            if (artContainer != null) artContainer.setAlpha(1f);
+            if (artContainer != null) {
+                artContainer.setAlpha(1f);
+                artContainer.setScaleX(1f);
+                artContainer.setScaleY(1f);
+                artContainer.setClipToOutline(false);
+                artContainer.setOutlineProvider(ViewOutlineProvider.BACKGROUND);
+            }
         }
 
         for (View bar : hiddenNativeBars) {
@@ -1801,6 +1926,8 @@ public final class M3NavigationFilter {
 
         MiniBlurBackdropView blurView = miniBlurViewRef.get();
         if (blurView != null) blurView.setVisibility(View.GONE);
+        NowPlayingAmbientView ambientView = ambientViewRef.get();
+        if (ambientView != null) ambientView.setVisibility(View.GONE);
         MiniWaveSeekBarView waveView = waveSeekBarRef.get();
         if (waveView != null) waveView.setVisibility(View.GONE);
 
@@ -2296,6 +2423,499 @@ public final class M3NavigationFilter {
         @Override
         public void getOutline(View view, Outline outline) {
             outline.setRoundRect(l, t, Math.max(l, r), Math.max(t, b), Math.max(0f, radius));
+        }
+    }
+
+    private static void updateNowPlayingAmbient(
+            View playerPage,
+            @Nullable View artContainer,
+            int overlayH,
+            float collapseRatio,
+            boolean isPlayerParkedEmpty,
+            int fallbackColor
+    ) {
+        if (!prefAmbientMode || isPlayerParkedEmpty || collapseRatio >= 0.85f) {
+            NowPlayingAmbientView existing = ambientViewRef.get();
+            if (existing != null && existing.getVisibility() != View.GONE) {
+                existing.setVisibility(View.GONE);
+            }
+            return;
+        }
+
+        if (!(playerPage instanceof ViewGroup ppVg)) return;
+        ViewGroup ambientHost = resolveAmbientHost(ppVg, artContainer, overlayH);
+
+        NowPlayingAmbientView ambientView = ambientViewRef.get();
+        int targetIndex = resolveAmbientInsertIndex(ambientHost, artContainer);
+        if (ambientView == null || ambientView.getParent() != ambientHost) {
+            if (ambientView != null && ambientView.getParent() instanceof ViewGroup oldParent) {
+                oldParent.removeView(ambientView);
+            }
+            ambientView = new NowPlayingAmbientView(ambientHost.getContext());
+            ambientView.setElevation(0f);
+            ambientView.setTranslationZ(-0.5f);
+            ambientView.setClickable(false);
+            ambientView.setFocusable(false);
+            ambientView.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+            ambientHost.addView(ambientView, targetIndex, new ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+            ));
+            ambientViewRef = new WeakReference<>(ambientView);
+        }
+
+        float ambientAlpha = Math.max(0f, Math.min(1f, (0.85f - collapseRatio) / 0.85f));
+        if (ambientView.getVisibility() != View.VISIBLE) {
+            ambientView.setVisibility(View.VISIBLE);
+        }
+        ambientView.setAlpha(ambientAlpha);
+
+        long nowMs = SystemClock.uptimeMillis();
+        if (!TextUtils.equals(lastSampledTrackKey, lastAmbientTrackKey)) {
+            lastAmbientTrackKey = lastSampledTrackKey;
+            ambientHasBitmapForTrack = false;
+            lastAmbientDrawableSig = 0;
+            lastAmbientSampleMs = 0L;
+        }
+
+        Drawable artDrawable = findPrimaryAlbumArtDrawable(artContainer);
+        int drawableSig = 0;
+        if (artDrawable != null) {
+            drawableSig = System.identityHashCode(artDrawable) * 31
+                    + artDrawable.getIntrinsicWidth() * 17
+                    + artDrawable.getIntrinsicHeight();
+        }
+
+        boolean shouldSample = false;
+        if (artDrawable != null) {
+            if (drawableSig != lastAmbientDrawableSig) {
+                shouldSample = true;
+            } else if (!ambientHasBitmapForTrack && (nowMs - lastAmbientSampleMs) >= 350L) {
+                shouldSample = true;
+            } else if ((nowMs - newTrackStartTimeMs) <= 2500L && (nowMs - lastAmbientSampleMs) >= 500L) {
+                shouldSample = true;
+            }
+        }
+
+        if (shouldSample && artDrawable != null) {
+            lastAmbientSampleMs = nowMs;
+            if (sampleAlbumArtIntoAmbient(artDrawable, ambientView, fallbackColor)) {
+                lastAmbientDrawableSig = drawableSig;
+                ambientHasBitmapForTrack = true;
+            } else if (!ambientHasBitmapForTrack) {
+                ambientView.updateFallbackFromColor(fallbackColor);
+            }
+        } else if (!ambientHasBitmapForTrack) {
+            ambientView.updateFallbackFromColor(fallbackColor);
+        }
+    }
+
+    private static ViewGroup resolveAmbientHost(ViewGroup playerPage, @Nullable View artContainer, int overlayH) {
+        if (artContainer == null) return playerPage;
+        ViewGroup best = playerPage;
+        ViewParent p = artContainer.getParent();
+        int hops = 0;
+        while (p instanceof ViewGroup vg && hops < 6) {
+            if (vg == playerPage) break;
+            if (vg.getHeight() >= overlayH * 0.65f && vg.getWidth() >= playerPage.getWidth() * 0.85f) {
+                Drawable bg = vg.getBackground();
+                if (bg instanceof ColorDrawable || bg instanceof GradientDrawable) {
+                    best = vg;
+                    break;
+                }
+            }
+            p = vg.getParent();
+            hops++;
+        }
+        return best;
+    }
+
+    private static int resolveAmbientInsertIndex(ViewGroup host, @Nullable View artContainer) {
+        int minIdx = 0;
+        if (host.getChildCount() > 0 && host.getChildAt(0) instanceof MiniBlurBackdropView) {
+            minIdx = 1;
+        }
+        if (artContainer != null) {
+            for (int i = minIdx; i < host.getChildCount(); i++) {
+                View child = host.getChildAt(i);
+                if (child == artContainer || isDescendantOf(artContainer, child)) {
+                    return i;
+                }
+            }
+        }
+        return Math.min(minIdx, host.getChildCount());
+    }
+
+    @Nullable
+    private static Drawable findPrimaryAlbumArtDrawable(@Nullable View artContainer) {
+        if (artContainer == null) return null;
+        ImageView best = findLargestAlbumImageView(artContainer, null, 0);
+        return (best != null) ? best.getDrawable() : null;
+    }
+
+    @Nullable
+    private static ImageView findLargestAlbumImageView(View view, @Nullable ImageView best, int depth) {
+        if (view == null || depth > 7 || view.getVisibility() != View.VISIBLE) return best;
+        if (view instanceof ImageView iv) {
+            Drawable d = iv.getDrawable();
+            if (d != null) {
+                int iw = Math.max(iv.getWidth(), d.getIntrinsicWidth());
+                int ih = Math.max(iv.getHeight(), d.getIntrinsicHeight());
+                if (iw >= 48 && ih >= 48) {
+                    long area = (long) iw * (long) ih;
+                    long bestArea = 0L;
+                    if (best != null && best.getDrawable() != null) {
+                        int bw = Math.max(best.getWidth(), best.getDrawable().getIntrinsicWidth());
+                        int bh = Math.max(best.getHeight(), best.getDrawable().getIntrinsicHeight());
+                        bestArea = (long) bw * (long) bh;
+                    }
+                    if (best == null || area > bestArea) {
+                        best = iv;
+                    }
+                }
+            }
+            return best;
+        }
+        if (view instanceof ViewGroup vg) {
+            for (int i = 0; i < vg.getChildCount(); i++) {
+                best = findLargestAlbumImageView(vg.getChildAt(i), best, depth + 1);
+            }
+        }
+        return best;
+    }
+
+    private static boolean sampleAlbumArtIntoAmbient(
+            Drawable drawable,
+            NowPlayingAmbientView ambientView,
+            int fallbackColor
+    ) {
+        try {
+            if (ambientScratchBitmap == null || ambientScratchCanvas == null) {
+                ambientScratchBitmap = Bitmap.createBitmap(
+                        AMBIENT_SAMPLE_SIZE, AMBIENT_SAMPLE_SIZE, Bitmap.Config.ARGB_8888);
+                ambientScratchCanvas = new Canvas(ambientScratchBitmap);
+            }
+            ambientScratchBitmap.eraseColor(Color.TRANSPARENT);
+            ambientSavedBounds.set(drawable.getBounds());
+            drawable.setBounds(0, 0, AMBIENT_SAMPLE_SIZE, AMBIENT_SAMPLE_SIZE);
+            drawable.draw(ambientScratchCanvas);
+            drawable.setBounds(ambientSavedBounds);
+
+            ambientScratchBitmap.getPixels(
+                    ambientScratchPixels, 0, AMBIENT_SAMPLE_SIZE,
+                    0, 0, AMBIENT_SAMPLE_SIZE, AMBIENT_SAMPLE_SIZE);
+
+            int opaqueCount = 0;
+            int nonBlackCount = 0;
+            for (int px : ambientScratchPixels) {
+                if (Color.alpha(px) > 120) {
+                    opaqueCount++;
+                    if (Color.red(px) > 8 || Color.green(px) > 8 || Color.blue(px) > 8) {
+                        nonBlackCount++;
+                    }
+                }
+            }
+            if (opaqueCount < 64 || nonBlackCount < 16) return false;
+
+            int half = AMBIENT_SAMPLE_SIZE / 2;
+            int cTL = extractQuadrantAmbientColor(ambientScratchPixels, 0, 0, half, half, fallbackColor);
+            int cTR = extractQuadrantAmbientColor(ambientScratchPixels, half, 0, AMBIENT_SAMPLE_SIZE, half, fallbackColor);
+            int cBL = extractQuadrantAmbientColor(ambientScratchPixels, 0, half, half, AMBIENT_SAMPLE_SIZE, fallbackColor);
+            int cBR = extractQuadrantAmbientColor(ambientScratchPixels, half, half, AMBIENT_SAMPLE_SIZE, AMBIENT_SAMPLE_SIZE, fallbackColor);
+            int dominant = extractQuadrantAmbientColor(ambientScratchPixels, 0, 0, AMBIENT_SAMPLE_SIZE, AMBIENT_SAMPLE_SIZE, fallbackColor);
+
+            // Fast 2-pass separable box blur on 32x32 sample for an ultra-soft ambient mesh
+            boxBlurPixels(ambientScratchPixels, ambientBlurTemp, AMBIENT_SAMPLE_SIZE, AMBIENT_SAMPLE_SIZE, 3);
+            boxBlurPixels(ambientScratchPixels, ambientBlurTemp, AMBIENT_SAMPLE_SIZE, AMBIENT_SAMPLE_SIZE, 2);
+
+            Bitmap blurredCopy = Bitmap.createBitmap(
+                    AMBIENT_SAMPLE_SIZE, AMBIENT_SAMPLE_SIZE, Bitmap.Config.ARGB_8888);
+            blurredCopy.setPixels(
+                    ambientScratchPixels, 0, AMBIENT_SAMPLE_SIZE,
+                    0, 0, AMBIENT_SAMPLE_SIZE, AMBIENT_SAMPLE_SIZE);
+
+            ambientView.updateFromAlbumArt(blurredCopy, dominant, cTL, cTR, cBL, cBR);
+            return true;
+        } catch (Throwable ignored) {
+            try {
+                drawable.setBounds(ambientSavedBounds);
+            } catch (Throwable ignored2) {}
+            return false;
+        }
+    }
+
+    private static int extractQuadrantAmbientColor(
+            int[] pixels, int x0, int y0, int x1, int y1, int fallbackColor
+    ) {
+        double sumR = 0, sumG = 0, sumB = 0, sumW = 0;
+        double rawR = 0, rawG = 0, rawB = 0;
+        int count = 0;
+        float[] hsv = new float[3];
+
+        for (int y = y0; y < y1; y++) {
+            int row = y * AMBIENT_SAMPLE_SIZE;
+            for (int x = x0; x < x1; x++) {
+                int px = pixels[row + x];
+                if (Color.alpha(px) < 100) continue;
+                int r = Color.red(px), g = Color.green(px), b = Color.blue(px);
+                rawR += r; rawG += g; rawB += b; count++;
+                Color.RGBToHSV(r, g, b, hsv);
+                float sat = hsv[1];
+                float val = hsv[2];
+                // Strongly favor saturated, mid-to-bright tones while avoiding pure black/white borders
+                if (val < 0.08f) continue;
+                double w = 0.25 + (sat * sat * 3.5) + (val * (1.15 - Math.abs(val - 0.62)) * 0.6);
+                sumR += r * w;
+                sumG += g * w;
+                sumB += b * w;
+                sumW += w;
+            }
+        }
+        int base;
+        if (sumW > 0.01) {
+            base = Color.rgb(
+                    Math.min(255, (int) Math.round(sumR / sumW)),
+                    Math.min(255, (int) Math.round(sumG / sumW)),
+                    Math.min(255, (int) Math.round(sumB / sumW))
+            );
+        } else if (count > 0) {
+            base = Color.rgb(
+                    Math.min(255, (int) Math.round(rawR / count)),
+                    Math.min(255, (int) Math.round(rawG / count)),
+                    Math.min(255, (int) Math.round(rawB / count))
+            );
+        } else {
+            base = fallbackColor | 0xFF000000;
+        }
+        return tuneAmbientOrbColor(base);
+    }
+
+    private static int tuneAmbientOrbColor(int color) {
+        float[] hsv = new float[3];
+        Color.colorToHSV(color | 0xFF000000, hsv);
+        if (hsv[1] > 0.05f) {
+            hsv[1] = Math.min(0.86f, Math.max(0.24f, hsv[1] * 1.22f));
+        }
+        hsv[2] = Math.max(0.30f, Math.min(0.76f, hsv[2] < 0.30f ? hsv[2] + 0.22f : hsv[2] * 0.92f));
+        return Color.HSVToColor(hsv) | 0xFF000000;
+    }
+
+    private static int tuneAmbientBaseColor(int color) {
+        float[] hsv = new float[3];
+        Color.colorToHSV(color | 0xFF000000, hsv);
+        hsv[1] = Math.min(0.60f, hsv[1] * 0.85f);
+        hsv[2] = Math.max(0.06f, Math.min(0.14f, hsv[2] * 0.22f));
+        return Color.HSVToColor(hsv) | 0xFF000000;
+    }
+
+    private static int shiftHueAmbientColor(int color, float hueDeltaDeg, float valScale) {
+        float[] hsv = new float[3];
+        Color.colorToHSV(color | 0xFF000000, hsv);
+        hsv[0] = (hsv[0] + hueDeltaDeg + 360f) % 360f;
+        hsv[1] = Math.min(0.82f, Math.max(0.26f, hsv[1] * 1.15f));
+        hsv[2] = Math.max(0.28f, Math.min(0.72f, hsv[2] * valScale));
+        return Color.HSVToColor(hsv) | 0xFF000000;
+    }
+
+    private static void boxBlurPixels(int[] pixels, int[] temp, int w, int h, int radius) {
+        int span = radius * 2 + 1;
+        // Horizontal pass
+        for (int y = 0; y < h; y++) {
+            int row = y * w;
+            for (int x = 0; x < w; x++) {
+                int r = 0, g = 0, b = 0;
+                for (int dx = -radius; dx <= radius; dx++) {
+                    int sx = Math.max(0, Math.min(w - 1, x + dx));
+                    int px = pixels[row + sx];
+                    r += Color.red(px);
+                    g += Color.green(px);
+                    b += Color.blue(px);
+                }
+                temp[row + x] = Color.rgb(r / span, g / span, b / span);
+            }
+        }
+        // Vertical pass
+        for (int x = 0; x < w; x++) {
+            for (int y = 0; y < h; y++) {
+                int r = 0, g = 0, b = 0;
+                for (int dy = -radius; dy <= radius; dy++) {
+                    int sy = Math.max(0, Math.min(h - 1, y + dy));
+                    int px = temp[sy * w + x];
+                    r += Color.red(px);
+                    g += Color.green(px);
+                    b += Color.blue(px);
+                }
+                pixels[y * w + x] = Color.rgb(r / span, g / span, b / span);
+            }
+        }
+    }
+
+    // Living album-art ambient glow backdrop rendered behind Now Playing content
+    private static final class NowPlayingAmbientView extends View {
+        private static final long CROSSFADE_MS = 650L;
+
+        private final Paint basePaint = new Paint();
+        private final Paint meshPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+        private final Paint orbPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.DITHER_FLAG);
+        private final Paint scrimPaint = new Paint(Paint.DITHER_FLAG);
+        private final Matrix orbMatrix = new Matrix();
+        private final RectF meshRect = new RectF();
+
+        @Nullable private Bitmap currBitmap = null;
+        @Nullable private Bitmap prevBitmap = null;
+        private long bitmapChangeMs = 0L;
+
+        private int currBaseColor = 0xFF100E16;
+        private int targetBaseColor = 0xFF100E16;
+        private final int[] currOrbColors = new int[]{0xFF4A3B76, 0xFF6B3E68, 0xFF28486B, 0xFF5A4562};
+        private final int[] targetOrbColors = new int[]{0xFF4A3B76, 0xFF6B3E68, 0xFF28486B, 0xFF5A4562};
+
+        private final RadialGradient[] orbShaders = new RadialGradient[4];
+        private final int[] shaderColors = new int[4];
+        private final float[] orbX = new float[4];
+        private final float[] orbY = new float[4];
+        private float cachedOrbRadius = -1f;
+        @Nullable private LinearGradient scrimShader = null;
+        private int cachedScrimH = -1;
+        private int lastFallbackColor = 0;
+
+        NowPlayingAmbientView(Context context) {
+            super(context);
+            setWillNotDraw(false);
+            basePaint.setStyle(Paint.Style.FILL);
+            orbPaint.setStyle(Paint.Style.FILL);
+            scrimPaint.setStyle(Paint.Style.FILL);
+        }
+
+        void updateFromAlbumArt(Bitmap blurredMesh, int dominant, int cTL, int cTR, int cBL, int cBR) {
+            if (prevBitmap != null && prevBitmap != currBitmap && !prevBitmap.isRecycled()) {
+                prevBitmap.recycle();
+            }
+            prevBitmap = currBitmap;
+            currBitmap = blurredMesh;
+            bitmapChangeMs = SystemClock.uptimeMillis();
+            targetBaseColor = tuneAmbientBaseColor(dominant);
+            targetOrbColors[0] = cTL;
+            targetOrbColors[1] = cTR;
+            targetOrbColors[2] = cBL;
+            targetOrbColors[3] = cBR;
+            invalidate();
+        }
+
+        void updateFallbackFromColor(int baseColor) {
+            int opaque = baseColor | 0xFF000000;
+            if (opaque == lastFallbackColor && currBitmap == null) return;
+            lastFallbackColor = opaque;
+            targetBaseColor = tuneAmbientBaseColor(opaque);
+            targetOrbColors[0] = tuneAmbientOrbColor(opaque);
+            targetOrbColors[1] = shiftHueAmbientColor(opaque, 28f, 1.08f);
+            targetOrbColors[2] = shiftHueAmbientColor(opaque, -32f, 0.92f);
+            targetOrbColors[3] = shiftHueAmbientColor(opaque, 14f, 1.15f);
+            invalidate();
+        }
+
+        private void ensureOrbShader(int idx, int color, float radius) {
+            if (orbShaders[idx] != null && shaderColors[idx] == color && Math.abs(cachedOrbRadius - radius) < 1f) {
+                return;
+            }
+            shaderColors[idx] = color;
+            orbShaders[idx] = new RadialGradient(
+                    0f, 0f, Math.max(1f, radius),
+                    new int[]{withAlpha(color, 185), withAlpha(color, 82), withAlpha(color, 0)},
+                    new float[]{0f, 0.52f, 1f},
+                    Shader.TileMode.CLAMP
+            );
+        }
+
+        @Override
+        protected void onDraw(@NonNull Canvas canvas) {
+            int w = getWidth();
+            int h = getHeight();
+            if (w <= 0 || h <= 0) return;
+
+            // Smoothly converge colors toward the active album art palette
+            currBaseColor = blendArgb(currBaseColor, targetBaseColor, 0.08f);
+            for (int i = 0; i < 4; i++) {
+                currOrbColors[i] = blendArgb(currOrbColors[i], targetOrbColors[i], 0.08f);
+            }
+
+            float intensity = Math.max(0.25f, Math.min(1.0f, prefAmbientIntensityPct / 100f));
+            long now = SystemClock.uptimeMillis();
+            double t = now / 1000.0;
+
+            // 1. Deep tonal base canvas
+            basePaint.setColor(currBaseColor);
+            canvas.drawRect(0f, 0f, w, h, basePaint);
+
+            // 2. Softly blurred album art mesh with slow breathing scale & gentle drift
+            float fadeT = Math.max(0f, Math.min(1f, (now - bitmapChangeMs) / (float) CROSSFADE_MS));
+            float meshScale = 1.24f + 0.07f * (float) Math.sin(t * 0.24);
+            float meshSize = Math.max(w, h) * meshScale;
+            float driftX = w * 0.045f * (float) Math.sin(t * 0.19);
+            float driftY = h * 0.035f * (float) Math.cos(t * 0.15);
+            float cx = w * 0.5f + driftX;
+            float cy = h * 0.40f + driftY;
+            meshRect.set(cx - meshSize * 0.5f, cy - meshSize * 0.5f, cx + meshSize * 0.5f, cy + meshSize * 0.5f);
+            float rotDeg = 5.5f * (float) Math.sin(t * 0.13);
+            int maxMeshAlpha = Math.round(145f * intensity);
+
+            if (prevBitmap != null && !prevBitmap.isRecycled() && fadeT < 0.99f) {
+                int save = canvas.save();
+                canvas.rotate(rotDeg, w * 0.5f, h * 0.42f);
+                meshPaint.setAlpha(Math.round(maxMeshAlpha * (1f - fadeT)));
+                canvas.drawBitmap(prevBitmap, null, meshRect, meshPaint);
+                canvas.restoreToCount(save);
+            }
+            if (currBitmap != null && !currBitmap.isRecycled()) {
+                int save = canvas.save();
+                canvas.rotate(rotDeg, w * 0.5f, h * 0.42f);
+                meshPaint.setAlpha(Math.round(maxMeshAlpha * fadeT));
+                canvas.drawBitmap(currBitmap, null, meshRect, meshPaint);
+                canvas.restoreToCount(save);
+            }
+
+            // 3. Four slowly drifting multi-quadrant ambient glow orbs (zero per-frame allocations)
+            float orbRadius = Math.max(w, h) * 0.58f;
+            if (Math.abs(cachedOrbRadius - orbRadius) >= 1f) {
+                for (int i = 0; i < 4; i++) orbShaders[i] = null;
+                cachedOrbRadius = orbRadius;
+            }
+            int orbAlpha = Math.round(210f * intensity);
+            orbPaint.setAlpha(orbAlpha);
+
+            orbX[0] = w * (0.20f + 0.14f * (float) Math.sin(t * 0.31));
+            orbY[0] = h * (0.18f + 0.10f * (float) Math.cos(t * 0.25));
+            orbX[1] = w * (0.82f + 0.14f * (float) Math.cos(t * 0.27));
+            orbY[1] = h * (0.24f + 0.11f * (float) Math.sin(t * 0.29));
+            orbX[2] = w * (0.24f + 0.15f * (float) Math.cos(t * 0.22 + 1.2));
+            orbY[2] = h * (0.62f + 0.12f * (float) Math.sin(t * 0.26 + 0.8));
+            orbX[3] = w * (0.78f + 0.13f * (float) Math.sin(t * 0.24 + 2.1));
+            orbY[3] = h * (0.58f + 0.12f * (float) Math.cos(t * 0.21 + 1.7));
+
+            for (int i = 0; i < 4; i++) {
+                ensureOrbShader(i, currOrbColors[i], orbRadius);
+                orbMatrix.setTranslate(orbX[i], orbY[i]);
+                orbShaders[i].setLocalMatrix(orbMatrix);
+                orbPaint.setShader(orbShaders[i]);
+                canvas.drawCircle(orbX[i], orbY[i], orbRadius, orbPaint);
+            }
+
+            // 4. Legibility vignette scrim so white controls, title & lyrics tabs remain crisp
+            if (scrimShader == null || cachedScrimH != h) {
+                cachedScrimH = h;
+                scrimShader = new LinearGradient(
+                        0f, 0f, 0f, h,
+                        new int[]{0x55000000, 0x18000000, 0x44000000, 0xA8000000},
+                        new float[]{0f, 0.28f, 0.64f, 1f},
+                        Shader.TileMode.CLAMP
+                );
+                scrimPaint.setShader(scrimShader);
+            }
+            canvas.drawRect(0f, 0f, w, h, scrimPaint);
+
+            if (getVisibility() == VISIBLE && getAlpha() > 0.02f) {
+                postInvalidateOnAnimation();
+            }
         }
     }
 

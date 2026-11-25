@@ -42,7 +42,7 @@ private val COMPATIBILITY_YOUTUBE_MUSIC_ANY = Compatibility(
 @Suppress("unused")
 val m3NavigationPatch = patch(
     name = "M3 Redesign addon",
-    description = "Redesigns the miniplayer, navigation bar, and Now Playing transition into a customizable Material 3 Expressive layout with wave seekbar, rotating wavy search button, and dynamic album palette.",
+    description = "Redesigns the miniplayer, navigation bar, and Now Playing screen into a customizable Material 3 Expressive layout with wave seekbar, rotating wavy search button, ambient glow, and dynamic album palette.",
     default = false
 ) {
     dependsOn(versionCheckPatch)
@@ -86,10 +86,6 @@ val m3NavigationPatch = patch(
                 appendChild(M3_PREFERENCE_TAG) {
                     setAttribute("android:key", M3_PREFERENCE_KEY)
                     setAttribute("android:title", "M3 Redesign addon")
-                    setAttribute(
-                        "android:summary",
-                        "Configure M3 navigation bar, miniplayer, Now Playing transition, wavy search button, and blur"
-                    )
                     setAttribute("android:layout", "@layout/morphe_preference_with_icon")
                     setAttribute("android:selectable", "true")
                 }
@@ -111,10 +107,6 @@ val m3NavigationPatch = patch(
                         rootNode.appendChild(M3_PREFERENCE_TAG) {
                             setAttribute("android:key", M3_PREFERENCE_KEY)
                             setAttribute("android:title", "M3 Redesign addon")
-                            setAttribute(
-                                "android:summary",
-                                "Configure M3 navigation bar, miniplayer, Now Playing transition, wavy search button, and blur"
-                            )
                             if (prefPath != "res/xml/morphe_prefs.xml") {
                                 setAttribute("android:layout", "@layout/morphe_preference_with_icon")
                             }

@@ -55,8 +55,8 @@ import app.morphe.extension.shared.ui.Dim;
 
 /**
  * Registers the "M3 Redesign addon" PreferenceScreen with an M3 icon in Morphe settings,
- * greys out M3 sub-settings when disabled, and harmonizes official Morphe settings
- * (auto-syncing, backing up/restoring, and greying out conflicting official toggles).
+ * exposes miniplayer/nav/ambient-mode controls, greys out M3 sub-settings when disabled,
+ * and harmonizes official Morphe settings (auto-syncing, backing up/restoring, and greying out).
  */
 @SuppressWarnings({"unused", "deprecation"})
 public class M3NavigationPreference extends Preference {
@@ -89,7 +89,6 @@ public class M3NavigationPreference extends Preference {
 
     private void init() {
         setTitle("M3 Redesign addon");
-        setSummary("Configure M3 navigation bar, miniplayer, Now Playing transition, wavy search button, and blur");
         applyMenuIconAndLayout(this);
     }
 
@@ -181,17 +180,20 @@ public class M3NavigationPreference extends Preference {
         final PreferenceScreen screen = pm.createPreferenceScreen(context);
         screen.setKey("morphe_music_m3_navigation_screen");
         screen.setTitle("M3 Redesign addon");
-        screen.setSummary("Configure M3 navigation bar, miniplayer, Now Playing transition, wavy search button, and blur");
 
         final List<Preference> m3DependentPrefs = new ArrayList<>();
         final Preference[] rotationSpeedPrefHolder = {null};
+        final Preference[] ambientIntensityPrefHolder = {null};
 
         final Runnable refreshAvailability = () -> {
             boolean m3On = M3NavigationFilter.ENABLED.get();
             boolean rotateOn = M3NavigationFilter.ROTATE_SEARCH.get();
+            boolean ambientOn = M3NavigationFilter.AMBIENT_MODE.get();
             for (Preference p : m3DependentPrefs) {
                 if (p == rotationSpeedPrefHolder[0]) {
                     p.setEnabled(m3On && rotateOn);
+                } else if (p == ambientIntensityPrefHolder[0]) {
+                    p.setEnabled(m3On && ambientOn);
                 } else {
                     p.setEnabled(m3On);
                 }
@@ -245,6 +247,12 @@ public class M3NavigationPreference extends Preference {
                     M3NavigationFilter.onDynamicColorToggled(context, checked);
                     refreshAvailability.run();
                 }));
+
+        m3DependentPrefs.add(addSwitch(context, generalCat,
+                M3NavigationFilter.AMBIENT_MODE,
+                "Now Playing ambient mode",
+                "Show a soft living ambient glow behind the Now Playing screen based on the album art",
+                checked -> refreshAvailability.run()));
 
         m3DependentPrefs.add(addSwitch(context, generalCat,
                 M3NavigationFilter.REPLACE_LIB_ACTION,
@@ -334,6 +342,13 @@ public class M3NavigationPreference extends Preference {
                 M3NavigationFilter.BLUR_RADIUS_DP,
                 "Background blur radius (0 = off)",
                 0, 40, "dp"));
+
+        Preference ambientIntensityPref = addSliderPreference(context, sizeCat,
+                M3NavigationFilter.AMBIENT_INTENSITY_PCT,
+                "Now Playing ambient intensity",
+                25, 100, "%");
+        ambientIntensityPrefHolder[0] = ambientIntensityPref;
+        m3DependentPrefs.add(ambientIntensityPref);
 
         Preference resetPref = new Preference(context);
         resetPref.setKey("morphe_music_m3_navigation_reset");

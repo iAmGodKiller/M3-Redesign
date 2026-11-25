@@ -13,7 +13,7 @@ A standalone **Material 3 Expressive** navigation bar and miniplayer redesign ad
 - **Material 3 Expressive Floating Navigation Bar** — Connected frosted-glass capsules (`Home` · `Miniplayer` · `Library`) with live hardware-accelerated backdrop blur (Android 12+), auto-hide on scroll, and optional tablet/landscape split layout.
 - **Rotating 12-Lobed Wavy Search Button** — Customizable lobe depth, scale, opacity, inverted palette, and smooth continuous rotation.
 - **Animated Wave Seekbar** — Custom animated sine-wave seekbar embedded inside the miniplayer, with native miniplayer progress bar residue cleanly suppressed (while leaving the fullscreen Now Playing seekbar untouched).
-- **Dynamic Album Colour Palette** — Extracts Material 3 tonal colours from the currently playing song artwork and adapts all capsules and icons smoothly.
+- **Dynamic Album Colour Palette & Now Playing Ambient Mode** — Extracts Material 3 tonal colours and a living, blurred multi-quadrant ambient glow directly from the song artwork behind Now Playing, alongside rounded miniplayer album art that scales automatically with navigation bar height.
 - **Full-Width Expanded Lyrics & Up Next Header** — Automatically widens the top miniplayer bar when viewing Lyrics or Up Next inside Now Playing, then smoothly narrows back into the M3 capsule when minimized.
 - **Last-Played Track Persistence** — Remembers your last played song & colour when YouTube Music starts idle, falling back to *"Ek Pal Ka Jeena"* by *Lucky Ali* when no prior track is stored (tap to resume playback).
 - **Automatic Official Morphe Settings Harmony** — Enabling `M3 Redesign addon` backs up your existing official Morphe toggles, syncs and greys out conflicting official settings automatically, and restores them cleanly if you turn M3 Redesign back off.
@@ -56,7 +56,7 @@ A standalone **Material 3 Expressive** navigation bar and miniplayer redesign ad
 All options live under **Settings → Morphe → M3 Redesign addon**:
 
 - **Master toggle** (off by default) & one-tap **Reset M3 Redesign settings**
-- **Miniplayer**: Show album art, show animated wave seekbar, automatic album colour palette
+- **Miniplayer & Now Playing**: Show album art (rounded & auto-scaled to bar height), show animated wave seekbar, automatic album colour palette, Now Playing ambient mode & intensity slider
 - **Library & FABs**: Swap Library icon with `+` / Shuffle while in Library, hide redundant playlist Play FAB
 - **Wavy Search button**: Rotate toggle, invert colours, size scale, lobe depth, rotation speed, opacity
 - **Layout & Glass**: Navigation bar height, max width, bar opacity, backdrop blur radius (`0` = off), auto-hide on scroll (`Both`, `Search only`, `Nav only`, `Off`), tablet/landscape left-right split
