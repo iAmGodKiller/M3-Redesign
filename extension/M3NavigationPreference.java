@@ -184,16 +184,20 @@ public class M3NavigationPreference extends Preference {
         final List<Preference> m3DependentPrefs = new ArrayList<>();
         final Preference[] rotationSpeedPrefHolder = {null};
         final Preference[] ambientIntensityPrefHolder = {null};
+        final Preference[] miniArtRadiusPrefHolder = {null};
 
         final Runnable refreshAvailability = () -> {
             boolean m3On = M3NavigationFilter.ENABLED.get();
             boolean rotateOn = M3NavigationFilter.ROTATE_SEARCH.get();
             boolean ambientOn = M3NavigationFilter.AMBIENT_MODE.get();
+            boolean showArtOn = M3NavigationFilter.SHOW_ALBUM_ART.get();
             for (Preference p : m3DependentPrefs) {
                 if (p == rotationSpeedPrefHolder[0]) {
                     p.setEnabled(m3On && rotateOn);
                 } else if (p == ambientIntensityPrefHolder[0]) {
                     p.setEnabled(m3On && ambientOn);
+                } else if (p == miniArtRadiusPrefHolder[0]) {
+                    p.setEnabled(m3On && showArtOn);
                 } else {
                     p.setEnabled(m3On);
                 }
@@ -231,7 +235,14 @@ public class M3NavigationPreference extends Preference {
                 M3NavigationFilter.SHOW_ALBUM_ART,
                 "Show album art in miniplayer",
                 "Display the rounded-square song thumbnail inside the miniplayer",
-                null));
+                checked -> refreshAvailability.run()));
+
+        Preference miniArtRadiusPref = addSliderPreference(context, generalCat,
+                M3NavigationFilter.MINI_ART_RADIUS_DP,
+                "Miniplayer album art corner radius",
+                0, 28, "dp", false);
+        miniArtRadiusPrefHolder[0] = miniArtRadiusPref;
+        m3DependentPrefs.add(miniArtRadiusPref);
 
         m3DependentPrefs.add(addSwitch(context, generalCat,
                 M3NavigationFilter.SHOW_WAVE_SEEKBAR,
@@ -260,9 +271,9 @@ public class M3NavigationPreference extends Preference {
                 "Hide the redundant floating Play button inside playlists",
                 null));
 
-        // Category 1b: Now Playing & Album Art (live-applied without restart)
+        // Category 1b: Now Playing Ambient Mode (live-applied without restart)
         PreferenceCategory ambientCat = new PreferenceCategory(context);
-        ambientCat.setTitle("Now Playing & album art");
+        ambientCat.setTitle("Now Playing ambient mode");
         screen.addPreference(ambientCat);
 
         m3DependentPrefs.add(addSwitch(context, ambientCat,
@@ -278,11 +289,6 @@ public class M3NavigationPreference extends Preference {
                 0, 100, "%", false);
         ambientIntensityPrefHolder[0] = ambientIntensityPref;
         m3DependentPrefs.add(ambientIntensityPref);
-
-        m3DependentPrefs.add(addSliderPreference(context, ambientCat,
-                M3NavigationFilter.ALBUM_ART_RADIUS_DP,
-                "Album art corner radius",
-                0, 36, "dp", false));
 
         // Category 2: Wavy Search Button
         PreferenceCategory searchCat = new PreferenceCategory(context);

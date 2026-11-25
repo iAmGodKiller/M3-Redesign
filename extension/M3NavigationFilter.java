@@ -28,9 +28,11 @@ import android.graphics.RenderEffect;
 import android.graphics.RenderNode;
 import android.graphics.Shader;
 import android.graphics.Typeface;
+import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.LayerDrawable;
 import android.media.AudioManager;
 import android.os.Build;
 import android.os.SystemClock;
@@ -146,8 +148,8 @@ public final class M3NavigationFilter {
             new IntegerSetting("morphe_music_m3_navigation_blur_radius_dp", 40);
     public static final IntegerSetting AMBIENT_INTENSITY_PCT =
             new IntegerSetting("morphe_music_m3_navigation_ambient_intensity_pct", 65);
-    public static final IntegerSetting ALBUM_ART_RADIUS_DP =
-            new IntegerSetting("morphe_music_m3_navigation_album_art_radius_dp", 12);
+    public static final IntegerSetting MINI_ART_RADIUS_DP =
+            new IntegerSetting("morphe_music_m3_navigation_mini_art_radius_dp", 8);
 
     // Fallback track when no previously played song is stored
     private static final String DEFAULT_FALLBACK_TITLE = "Ek Pal Ka Jeena";
@@ -183,7 +185,7 @@ public final class M3NavigationFilter {
     static int prefSearchRotationSec = 50;
     static int prefBlurRadiusDp = 40;
     static int prefAmbientIntensityPct = 65;
-    static int prefAlbumArtRadiusDp = 12;
+    static int prefMiniArtRadiusDp = 8;
 
     private static boolean officialAvailabilityHooked = false;
     private static final Map<String, Setting<?>> MANAGED_OFFICIAL_SETTINGS = new HashMap<>();
@@ -284,12 +286,20 @@ public final class M3NavigationFilter {
     private static WeakReference<View> origArtOutlineTargetRef = new WeakReference<>(null);
 
     // Non-square / letterboxed album art center-crop state (restored if M3 Redesign is turned off)
+    private static final int ART_BAR_SAMPLE_SIZE = 64;
     private static final Map<ImageView, ImageView.ScaleType> origArtScaleTypes = new WeakHashMap<>();
     private static final Map<View, Boolean> origArtChildClipToOutline = new WeakHashMap<>();
     private static final Map<ViewGroup, boolean[]> origArtGroupClips = new WeakHashMap<>();
-    private static int lastArtBarSig = 0;
-    private static float lastArtActiveWFrac = 1f;
-    private static float lastArtActiveHFrac = 1f;
+    private static final Map<Drawable, float[]> artBarBoundsCache = new WeakHashMap<>();
+    private static final Map<Drawable, Integer> artBarSigCache = new WeakHashMap<>();
+    @Nullable private static Bitmap artBarScratchBitmap = null;
+    @Nullable private static Canvas artBarScratchCanvas = null;
+    private static final int[] artBarScratchPixels = new int[ART_BAR_SAMPLE_SIZE * ART_BAR_SAMPLE_SIZE];
+    private static final Rect artBarSavedBounds = new Rect();
+    private static final Rect artBarDstRect = new Rect(0, 0, ART_BAR_SAMPLE_SIZE, ART_BAR_SAMPLE_SIZE);
+    private static final Matrix tmpArtCropMatrix = new Matrix();
+    private static final float[] tmpArtM1 = new float[9];
+    private static final float[] tmpArtM2 = new float[9];
 
     // Now Playing ambient mode album-art sampler state
     private static final int AMBIENT_SAMPLE_SIZE = 32;
@@ -402,7 +412,7 @@ public final class M3NavigationFilter {
         prefSearchRotationSec = SEARCH_ROTATION_SEC.get();
         prefBlurRadiusDp = BLUR_RADIUS_DP.get();
         prefAmbientIntensityPct = AMBIENT_INTENSITY_PCT.get();
-        prefAlbumArtRadiusDp = ALBUM_ART_RADIUS_DP.get();
+        prefMiniArtRadiusDp = MINI_ART_RADIUS_DP.get();
 
         if (!prefAmbientMode || prefAmbientIntensityPct <= 0) {
             NowPlayingAmbientView existingAmbient = ambientViewRef.get();
@@ -671,7 +681,7 @@ public final class M3NavigationFilter {
         SEARCH_ROTATION_SEC.resetToDefault();
         BLUR_RADIUS_DP.resetToDefault();
         AMBIENT_INTENSITY_PCT.resetToDefault();
-        ALBUM_ART_RADIUS_DP.resetToDefault();
+        MINI_ART_RADIUS_DP.resetToDefault();
         if (wasEnabled && !ENABLED.get()) {
             restoreOfficialHarmonySettings(context);
         }
@@ -1567,8 +1577,8 @@ public final class M3NavigationFilter {
         View artContainer = (WATCH_FRAGMENT_CONTAINER_ID != 0)
                 ? playerPage.findViewById(WATCH_FRAGMENT_CONTAINER_ID) : null;
 
-        // 3b. Now Playing Ambient Mode layered behind album art & controls when expanded
-        updateNowPlayingAmbient(playerPage, artContainer, overlayH, collapseRatio, isPlayerParkedEmpty, cachedNowPlayingColor);
+        // 3b. Now Playing Ambient Mode layered edge-to-edge behind album art & controls when expanded
+        updateNowPlayingAmbient(playerPage, artContainer, overlayW, overlayH, collapseRatio, isPlayerParkedEmpty, cachedNowPlayingColor);
 
         // 4. Reliably hide ALL native miniplayer progress bars / scrims / dividers (without touching Now Playing's time_bar)
         hideNativeMiniplayerProgressResidue(playerPage, overlayW, pillH);
@@ -1735,7 +1745,8 @@ public final class M3NavigationFilter {
                     && primaryArtIv.isShown()
                     && primaryArtIv.getAlpha() > 0.1f
                     && primaryArtIv.getDrawable() != null;
-            boolean isShowingVideo = !isShowingAlbumArt && hasVisibleVideoSurface(artContainer, 0);
+            View videoSurface = !isShowingAlbumArt ? findLargestVideoSurface(artContainer, null, 0) : null;
+            boolean isShowingVideo = (videoSurface != null);
 
             // If album art ImageView is inset inside artContainer, align the square outline to its center
             if (isShowingAlbumArt && minSide > 0 && primaryArtIv.getWidth() > 0 && primaryArtIv.getHeight() > 0) {
@@ -1754,22 +1765,40 @@ public final class M3NavigationFilter {
             int cropR = cropL + minSide;
             int cropB = cropT + minSide;
 
-            // Crop non-square / letterboxed album art cleanly into a square without black bars
-            if (isShowingAlbumArt && minSide > 0 && !isPlayerParkedEmpty) {
-                applySquareAlbumArtCrop(artContainer, minSide);
+            // For miniplayer on a 16:9 video surface inside a square black container, crop directly into the video frame
+            int miniCropL = cropL;
+            int miniCropT = cropT;
+            int miniCropR = cropR;
+            int miniCropB = cropB;
+            int miniSide = minSide;
+            if (isShowingVideo) {
+                int[] vBounds = computeRelativeBounds(videoSurface, artContainer);
+                if (vBounds != null) {
+                    int vw = vBounds[2] - vBounds[0];
+                    int vh = vBounds[3] - vBounds[1];
+                    int vSide = Math.min(vw, vh);
+                    if (vSide >= 48) {
+                        miniSide = vSide;
+                        miniCropL = vBounds[0] + (vw - vSide) / 2;
+                        miniCropT = vBounds[1] + (vh - vSide) / 2;
+                        miniCropR = miniCropL + vSide;
+                        miniCropB = miniCropT + vSide;
+                    }
+                }
             }
 
-            // Expanded Now Playing uses the user-configured album art radius; miniplayer matches its capsule radius (8dp)
-            float nowPlayingCornerPx = dpToPx(Math.max(0, Math.min(36, prefAlbumArtRadiusDp)));
-            float miniCornerPx = dpToPx(INNER_CORNER_DP);
-            int expL = isShowingVideo ? 0 : cropL;
-            int expT = isShowingVideo ? 0 : cropT;
-            int expR = isShowingVideo ? artW : cropR;
-            int expB = isShowingVideo ? artH : cropB;
+            // Crop non-square / letterboxed album art cleanly into a square without black bars (preserving native Now Playing corners)
+            boolean artViewScaledBeyondBounds = false;
+            if (isShowingAlbumArt && minSide > 0 && !isPlayerParkedEmpty) {
+                artViewScaledBeyondBounds = applySquareAlbumArtCrop(artContainer, minSide);
+            }
+
+            // Miniplayer album art radius is user-configurable (0-28dp, default 8dp matching the capsule); Now Playing stays native
+            float miniCornerPx = dpToPx(Math.max(0, Math.min(28, prefMiniArtRadiusDp)));
 
             if (collapseRatio >= 0.99f && !isPlayerParkedEmpty) {
-                float targetMinScale = (minSide > 0)
-                        ? Math.max(0.45f, Math.min(1.85f, artSize / (float) minSide))
+                float targetMinScale = (miniSide > 0)
+                        ? Math.max(0.45f, Math.min(2.40f, artSize / (float) miniSide))
                         : 1f;
                 restArtScaleRatio = targetMinScale / Math.max(0.05f, lastRawArtScale);
                 hasRestArtScale = true;
@@ -1780,9 +1809,9 @@ public final class M3NavigationFilter {
                 artContainer.setScaleY(targetMinScale);
                 lastSetArtScale = targetMinScale;
 
-                float visualSide = (minSide > 0) ? (minSide * targetMinScale) : artSize;
-                float targetMinTx = miniL + artInset - cropL * targetMinScale;
-                float targetMinTy = Math.max(0f, (pillH - visualSide) * 0.5f) - cropT * targetMinScale;
+                float visualSide = (miniSide > 0) ? (miniSide * targetMinScale) : artSize;
+                float targetMinTx = miniL + artInset - miniCropL * targetMinScale;
+                float targetMinTy = Math.max(0f, (pillH - visualSide) * 0.5f) - miniCropT * targetMinScale;
                 restArtOffsetX = targetMinTx - lastRawArtTx;
                 restArtOffsetY = targetMinTy - lastRawArtTy;
                 hasRestArtOffset = true;
@@ -1792,9 +1821,9 @@ public final class M3NavigationFilter {
                 lastSetArtTx = targetMinTx;
                 lastSetArtTy = targetMinTy;
 
-                if (minSide > 0) {
+                if (miniSide > 0) {
                     float localCornerPx = miniCornerPx / Math.max(0.25f, targetMinScale);
-                    applyMiniArtOutline(artContainer, cropL, cropT, cropR, cropB, localCornerPx);
+                    applyMiniArtOutline(artContainer, miniCropL, miniCropT, miniCropR, miniCropB, localCornerPx);
                 }
             } else if (collapseRatio > 0.004f && !isPlayerParkedEmpty) {
                 float appliedScale = lastRawArtScale;
@@ -1814,14 +1843,15 @@ public final class M3NavigationFilter {
                     lastSetArtTx = desiredTx;
                     lastSetArtTy = desiredTy;
                 }
-                if (minSide > 0) {
-                    int cl = Math.round(lerp(expL, cropL, collapseRatio));
-                    int ct = Math.round(lerp(expT, cropT, collapseRatio));
-                    int cr = Math.round(lerp(expR, cropR, collapseRatio));
-                    int cb = Math.round(lerp(expB, cropB, collapseRatio));
-                    float visualCornerPx = lerp(nowPlayingCornerPx, miniCornerPx, collapseRatio);
-                    float localCornerPx = visualCornerPx / Math.max(0.25f, appliedScale);
+                if (miniSide > 0 && collapseRatio > 0.02f) {
+                    int cl = Math.round(lerp(0f, miniCropL, collapseRatio));
+                    int ct = Math.round(lerp(0f, miniCropT, collapseRatio));
+                    int cr = Math.round(lerp(artW, miniCropR, collapseRatio));
+                    int cb = Math.round(lerp(artH, miniCropB, collapseRatio));
+                    float localCornerPx = miniCornerPx / Math.max(0.25f, appliedScale);
                     applyMiniArtOutline(artContainer, cl, ct, cr, cb, localCornerPx);
+                } else {
+                    restoreArtOutline(artContainer);
                 }
             } else {
                 float activeScale = Float.isNaN(lastRawArtScale) ? 1f : lastRawArtScale;
@@ -1832,9 +1862,10 @@ public final class M3NavigationFilter {
                 }
                 lastSetArtTx = Float.NaN;
                 lastSetArtTy = Float.NaN;
-                if (artW > 0 && artH > 0 && !isPlayerParkedEmpty) {
-                    float localCornerPx = nowPlayingCornerPx / Math.max(0.25f, Math.abs(activeScale));
-                    applyMiniArtOutline(artContainer, expL, expT, expR, expB, localCornerPx);
+                // Only clip artContainer in Now Playing if a physically rectangular ImageView had to be View-scaled to fill a square
+                if (artViewScaledBeyondBounds && minSide > 0 && !isPlayerParkedEmpty) {
+                    float nativeLikeCornerPx = dpToPx(12f) / Math.max(0.25f, Math.abs(activeScale));
+                    applyMiniArtOutline(artContainer, cropL, cropT, cropR, cropB, nativeLikeCornerPx);
                 } else {
                     restoreArtOutline(artContainer);
                 }
@@ -1890,32 +1921,42 @@ public final class M3NavigationFilter {
         return new int[]{l, t, l + w, t + h};
     }
 
-    private static boolean hasVisibleVideoSurface(@Nullable View view, int depth) {
+    @Nullable
+    private static View findLargestVideoSurface(@Nullable View view, @Nullable View best, int depth) {
         if (view == null || depth > 7 || view.getVisibility() != View.VISIBLE || view.getAlpha() <= 0.05f) {
-            return false;
+            return best;
         }
         if (view instanceof SurfaceView || view instanceof TextureView) {
-            return view.getWidth() >= 64 && view.getHeight() >= 64;
+            int w = view.getWidth();
+            int h = view.getHeight();
+            if (w >= 64 && h >= 64) {
+                long area = (long) w * (long) h;
+                long bestArea = (best != null) ? ((long) best.getWidth() * (long) best.getHeight()) : 0L;
+                if (best == null || area > bestArea) {
+                    best = view;
+                }
+            }
+            return best;
         }
         if (view instanceof ViewGroup vg) {
             for (int i = 0; i < vg.getChildCount(); i++) {
-                if (hasVisibleVideoSurface(vg.getChildAt(i), depth + 1)) return true;
+                best = findLargestVideoSurface(vg.getChildAt(i), best, depth + 1);
             }
         }
-        return false;
+        return best;
     }
 
-    private static void applySquareAlbumArtCrop(View artContainer, int sqSide) {
+    private static boolean applySquareAlbumArtCrop(View artContainer, int sqSide) {
         int containerW = artContainer.getWidth();
         int containerH = artContainer.getHeight();
-        if (containerW <= 0 || containerH <= 0 || sqSide <= 0) return;
-        applySquareAlbumArtCropRecursive(artContainer, artContainer, containerW, containerH, sqSide, 0);
+        if (containerW <= 0 || containerH <= 0 || sqSide <= 0) return false;
+        return applySquareAlbumArtCropRecursive(artContainer, artContainer, containerW, containerH, sqSide, 0);
     }
 
-    private static void applySquareAlbumArtCropRecursive(
+    private static boolean applySquareAlbumArtCropRecursive(
             View view, View artContainer, int containerW, int containerH, int sqSide, int depth
     ) {
-        if (view == null || depth > 7 || view.getVisibility() != View.VISIBLE) return;
+        if (view == null || depth > 7 || view.getVisibility() != View.VISIBLE) return false;
         if (view instanceof ImageView iv) {
             Drawable d = iv.getDrawable();
             int ivW = iv.getWidth();
@@ -1924,189 +1965,279 @@ public final class M3NavigationFilter {
                 if (!origArtScaleTypes.containsKey(iv)) {
                     origArtScaleTypes.put(iv, iv.getScaleType());
                 }
-                if (iv.getScaleType() != ImageView.ScaleType.CENTER_CROP) {
-                    iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
-                }
-                if (iv.getClipToOutline()) {
-                    if (!origArtChildClipToOutline.containsKey(iv)) {
-                        origArtChildClipToOutline.put(iv, true);
+
+                // Detect active non-black bounds [activeL, activeT, activeR, activeB] in normalized [0..1] drawable coords
+                float[] active = getCachedActiveArtBounds(d);
+                float actL = active[0];
+                float actT = active[1];
+                float actR = active[2];
+                float actB = active[3];
+
+                int dw = resolveDrawableIntrinsicWidth(d);
+                int dh = resolveDrawableIntrinsicHeight(d);
+
+                // Prefer ImageView.ScaleType.MATRIX so the bitmap is center-cropped INSIDE iv without altering iv's native rounded corners
+                int cw = Math.max(1, ivW - iv.getPaddingLeft() - iv.getPaddingRight());
+                int ch = Math.max(1, ivH - iv.getPaddingTop() - iv.getPaddingBottom());
+                if (dw > 0 && dh > 0) {
+                    float actW = Math.max(1f, (actR - actL) * dw);
+                    float actH = Math.max(1f, (actB - actT) * dh);
+                    float actCx = (actL + actR) * 0.5f * dw;
+                    float actCy = (actT + actB) * 0.5f * dh;
+                    float s = Math.max(cw / actW, ch / actH);
+
+                    tmpArtCropMatrix.reset();
+                    tmpArtCropMatrix.setTranslate(-actCx, -actCy);
+                    tmpArtCropMatrix.postScale(s, s);
+                    tmpArtCropMatrix.postTranslate(cw * 0.5f, ch * 0.5f);
+
+                    if (iv.getScaleType() != ImageView.ScaleType.MATRIX) {
+                        iv.setScaleType(ImageView.ScaleType.MATRIX);
                     }
-                    iv.setClipToOutline(false);
+                    if (!matricesNearlyEqual(iv.getImageMatrix(), tmpArtCropMatrix)) {
+                        iv.setImageMatrix(new Matrix(tmpArtCropMatrix));
+                    }
+                } else {
+                    if (iv.getScaleType() != ImageView.ScaleType.CENTER_CROP) {
+                        iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
+                    }
                 }
 
-                // Scale up rectangular ImageViews so they fill the full square slot without black bars
-                float scaleW = (sqSide > ivW) ? (sqSide / (float) ivW) : 1f;
-                float scaleH = (sqSide > ivH) ? (sqSide / (float) ivH) : 1f;
+                // If iv itself was laid out physically rectangular (e.g. 16:9 View inside a 1:1 container), scale iv to fill the square
+                float scaleW = (sqSide > ivW + 4) ? (sqSide / (float) ivW) : 1f;
+                float scaleH = (sqSide > ivH + 4) ? (sqSide / (float) ivH) : 1f;
                 float fillScale = Math.max(1f, Math.min(2.4f, Math.max(scaleW, scaleH)));
 
-                // Detect & crop out baked-in black letterbox/pillarbox bars (e.g., 480x360 YouTube thumbnails)
-                float barExtra = computeBakedBlackBarZoom(d, ivW, ivH, sqSide, fillScale);
-                float targetScale = Math.max(1f, Math.min(2.6f, fillScale * barExtra));
+                if (fillScale > 1.03f) {
+                    iv.setPivotX(ivW * 0.5f);
+                    iv.setPivotY(ivH * 0.5f);
+                    if (Math.abs(iv.getScaleX() - fillScale) > 0.005f) iv.setScaleX(fillScale);
+                    if (Math.abs(iv.getScaleY() - fillScale) > 0.005f) iv.setScaleY(fillScale);
 
-                iv.setPivotX(ivW * 0.5f);
-                iv.setPivotY(ivH * 0.5f);
-                if (Math.abs(iv.getScaleX() - targetScale) > 0.005f) {
-                    iv.setScaleX(targetScale);
-                }
-                if (Math.abs(iv.getScaleY() - targetScale) > 0.005f) {
-                    iv.setScaleY(targetScale);
-                }
-
-                // Ensure intermediate wrappers between iv and artContainer do not re-clip to 16:9 or override radius
-                ViewParent p = iv.getParent();
-                int hops = 0;
-                while (p instanceof ViewGroup vg && vg != artContainer && hops < 8) {
-                    if (!origArtGroupClips.containsKey(vg)) {
-                        origArtGroupClips.put(vg, new boolean[]{vg.getClipChildren(), vg.getClipToPadding()});
-                    }
-                    if (vg.getClipChildren()) vg.setClipChildren(false);
-                    if (vg.getClipToPadding()) vg.setClipToPadding(false);
-                    if (vg.getClipToOutline()) {
-                        if (!origArtChildClipToOutline.containsKey(vg)) {
-                            origArtChildClipToOutline.put(vg, true);
+                    ViewParent p = iv.getParent();
+                    int hops = 0;
+                    while (p instanceof ViewGroup vg && vg != artContainer && hops < 8) {
+                        if (!origArtGroupClips.containsKey(vg)) {
+                            origArtGroupClips.put(vg, new boolean[]{vg.getClipChildren(), vg.getClipToPadding()});
                         }
-                        vg.setClipToOutline(false);
+                        if (vg.getClipChildren()) vg.setClipChildren(false);
+                        if (vg.getClipToPadding()) vg.setClipToPadding(false);
+                        if (vg.getClipToOutline()) {
+                            if (!origArtChildClipToOutline.containsKey(vg)) {
+                                origArtChildClipToOutline.put(vg, true);
+                            }
+                            vg.setClipToOutline(false);
+                        }
+                        p = vg.getParent();
+                        hops++;
                     }
-                    p = vg.getParent();
-                    hops++;
+                    return true;
+                } else {
+                    if (Math.abs(iv.getScaleX() - 1f) > 0.005f) iv.setScaleX(1f);
+                    if (Math.abs(iv.getScaleY() - 1f) > 0.005f) iv.setScaleY(1f);
+                    return false;
                 }
             }
-            return;
+            return false;
         }
+        boolean scaledAny = false;
         if (view instanceof ViewGroup vg) {
             for (int i = 0; i < vg.getChildCount(); i++) {
-                applySquareAlbumArtCropRecursive(vg.getChildAt(i), artContainer, containerW, containerH, sqSide, depth + 1);
+                if (applySquareAlbumArtCropRecursive(vg.getChildAt(i), artContainer, containerW, containerH, sqSide, depth + 1)) {
+                    scaledAny = true;
+                }
             }
         }
+        return scaledAny;
     }
 
-    private static float computeBakedBlackBarZoom(Drawable drawable, int ivW, int ivH, int sqSide, float fillScale) {
-        int dw = drawable.getIntrinsicWidth();
-        int dh = drawable.getIntrinsicHeight();
-        if (dw <= 0 || dh <= 0 || ivW <= 0 || ivH <= 0) return 1f;
-
-        int sig = System.identityHashCode(drawable) * 31 + dw * 17 + dh;
-        if (sig != lastArtBarSig) {
-            analyzeBakedBlackBars(drawable, sig);
+    private static boolean matricesNearlyEqual(@Nullable Matrix a, Matrix b) {
+        if (a == null) return false;
+        a.getValues(tmpArtM1);
+        b.getValues(tmpArtM2);
+        for (int i = 0; i < 9; i++) {
+            if (Math.abs(tmpArtM1[i] - tmpArtM2[i]) > 0.01f) return false;
         }
-
-        float activeW = lastArtActiveWFrac;
-        float activeH = lastArtActiveHFrac;
-        if (activeW >= 0.99f && activeH >= 0.99f) return 1f;
-
-        float baseScale = Math.max(ivW / (float) dw, ivH / (float) dh);
-        float visibleActiveW = dw * baseScale * activeW * fillScale;
-        float visibleActiveH = dh * baseScale * activeH * fillScale;
-        float needW = (visibleActiveW > 1f) ? (sqSide / visibleActiveW) : 1f;
-        float needH = (visibleActiveH > 1f) ? (sqSide / visibleActiveH) : 1f;
-        float need = Math.max(needW, needH);
-        if (need <= 1.02f) return 1f;
-        return Math.min(1.85f, need * 1.03f);
+        return true;
     }
 
-    private static void analyzeBakedBlackBars(Drawable drawable, int sig) {
-        lastArtActiveWFrac = 1f;
-        lastArtActiveHFrac = 1f;
+    private static Drawable unwrapTopDrawable(Drawable drawable) {
+        Drawable cur = drawable;
+        int guard = 0;
+        while (cur instanceof LayerDrawable ld && ld.getNumberOfLayers() > 0 && guard < 4) {
+            Drawable top = ld.getDrawable(ld.getNumberOfLayers() - 1);
+            if (top == null || top == cur) break;
+            cur = top;
+            guard++;
+        }
+        return cur;
+    }
+
+    private static int resolveDrawableIntrinsicWidth(Drawable drawable) {
+        int w = drawable.getIntrinsicWidth();
+        if (w > 0) return w;
+        Drawable top = unwrapTopDrawable(drawable);
+        return top.getIntrinsicWidth();
+    }
+
+    private static int resolveDrawableIntrinsicHeight(Drawable drawable) {
+        int h = drawable.getIntrinsicHeight();
+        if (h > 0) return h;
+        Drawable top = unwrapTopDrawable(drawable);
+        return top.getIntrinsicHeight();
+    }
+
+    private static int computeDrawableContentSignature(Drawable drawable) {
+        Drawable top = unwrapTopDrawable(drawable);
+        int sig = System.identityHashCode(drawable) * 31
+                + System.identityHashCode(top) * 17
+                + top.getIntrinsicWidth() * 13
+                + top.getIntrinsicHeight() * 7;
+        if (top instanceof BitmapDrawable bd && bd.getBitmap() != null && !bd.getBitmap().isRecycled()) {
+            Bitmap bmp = bd.getBitmap();
+            sig = sig * 31 + System.identityHashCode(bmp) + bmp.getGenerationId();
+        }
+        return sig;
+    }
+
+    private static float[] getCachedActiveArtBounds(Drawable drawable) {
+        int sig = computeDrawableContentSignature(drawable);
+        Integer cachedSig = artBarSigCache.get(drawable);
+        float[] cachedBounds = artBarBoundsCache.get(drawable);
+        if (cachedSig != null && cachedSig == sig && cachedBounds != null) {
+            return cachedBounds;
+        }
+        float[] detected = analyzeBakedBlackBars(drawable);
+        if (detected != null) {
+            artBarSigCache.put(drawable, sig);
+            artBarBoundsCache.put(drawable, detected);
+            return detected;
+        }
+        return new float[]{0f, 0f, 1f, 1f};
+    }
+
+    // Returns [activeL, activeT, activeR, activeB] in [0..1] normalized drawable coords, or null if drawable not yet decoded
+    @Nullable
+    private static float[] analyzeBakedBlackBars(Drawable drawable) {
+        Drawable sampleTarget = unwrapTopDrawable(drawable);
+        if (sampleTarget.getIntrinsicWidth() <= 0 || sampleTarget.getIntrinsicHeight() <= 0) {
+            sampleTarget = drawable;
+        }
+        boolean boundsMutated = false;
         try {
-            if (ambientScratchBitmap == null || ambientScratchCanvas == null) {
-                ambientScratchBitmap = Bitmap.createBitmap(
-                        AMBIENT_SAMPLE_SIZE, AMBIENT_SAMPLE_SIZE, Bitmap.Config.ARGB_8888);
-                ambientScratchCanvas = new Canvas(ambientScratchBitmap);
+            if (artBarScratchBitmap == null || artBarScratchCanvas == null) {
+                artBarScratchBitmap = Bitmap.createBitmap(
+                        ART_BAR_SAMPLE_SIZE, ART_BAR_SAMPLE_SIZE, Bitmap.Config.ARGB_8888);
+                artBarScratchCanvas = new Canvas(artBarScratchBitmap);
             }
-            ambientScratchBitmap.eraseColor(Color.TRANSPARENT);
-            ambientSavedBounds.set(drawable.getBounds());
-            drawable.setBounds(0, 0, AMBIENT_SAMPLE_SIZE, AMBIENT_SAMPLE_SIZE);
-            drawable.draw(ambientScratchCanvas);
-            drawable.setBounds(ambientSavedBounds);
+            artBarScratchBitmap.eraseColor(Color.TRANSPARENT);
+            Bitmap directBmp = (sampleTarget instanceof BitmapDrawable bd) ? bd.getBitmap() : null;
+            if (directBmp != null && !directBmp.isRecycled()
+                    && directBmp.getWidth() > 0 && directBmp.getHeight() > 0
+                    && (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || directBmp.getConfig() != Bitmap.Config.HARDWARE)) {
+                artBarScratchCanvas.drawBitmap(directBmp, null, artBarDstRect, null);
+            } else {
+                artBarSavedBounds.set(sampleTarget.getBounds());
+                boundsMutated = true;
+                sampleTarget.setBounds(0, 0, ART_BAR_SAMPLE_SIZE, ART_BAR_SAMPLE_SIZE);
+                sampleTarget.draw(artBarScratchCanvas);
+                sampleTarget.setBounds(artBarSavedBounds);
+                boundsMutated = false;
+            }
 
-            ambientScratchBitmap.getPixels(
-                    ambientScratchPixels, 0, AMBIENT_SAMPLE_SIZE,
-                    0, 0, AMBIENT_SAMPLE_SIZE, AMBIENT_SAMPLE_SIZE);
+            artBarScratchBitmap.getPixels(
+                    artBarScratchPixels, 0, ART_BAR_SAMPLE_SIZE,
+                    0, 0, ART_BAR_SAMPLE_SIZE, ART_BAR_SAMPLE_SIZE);
 
+            final int n = ART_BAR_SAMPLE_SIZE;
             int opaqueCount = 0;
-            for (int px : ambientScratchPixels) {
+            for (int px : artBarScratchPixels) {
                 if (Color.alpha(px) >= 160) opaqueCount++;
             }
-            if (opaqueCount < 64) {
+            if (opaqueCount < 256) {
                 // Drawable not decoded yet; do not cache
-                return;
+                return null;
             }
-            lastArtBarSig = sig;
 
-            final int n = AMBIENT_SAMPLE_SIZE;
+            int maxScan = 24; // up to ~37.5% per side (handles 4:3, 16:9, and 21:9 letterboxed inside 1:1!)
             int topBars = 0;
-            for (int y = 0; y < 11; y++) {
-                if (isSampleRowBlack(ambientScratchPixels, y, n)) topBars++;
+            for (int y = 0; y < maxScan; y++) {
+                if (isSampleRowBlack(artBarScratchPixels, y, n)) topBars++;
                 else break;
             }
             int bottomBars = 0;
-            for (int y = n - 1; y >= n - 11; y--) {
-                if (isSampleRowBlack(ambientScratchPixels, y, n)) bottomBars++;
+            for (int y = n - 1; y >= n - maxScan; y--) {
+                if (isSampleRowBlack(artBarScratchPixels, y, n)) bottomBars++;
                 else break;
             }
             int leftBars = 0;
-            for (int x = 0; x < 11; x++) {
-                if (isSampleColBlack(ambientScratchPixels, x, n)) leftBars++;
+            for (int x = 0; x < maxScan; x++) {
+                if (isSampleColBlack(artBarScratchPixels, x, n)) leftBars++;
                 else break;
             }
             int rightBars = 0;
-            for (int x = n - 1; x >= n - 11; x--) {
-                if (isSampleColBlack(ambientScratchPixels, x, n)) rightBars++;
+            for (int x = n - 1; x >= n - maxScan; x--) {
+                if (isSampleColBlack(artBarScratchPixels, x, n)) rightBars++;
                 else break;
             }
 
             int vMin = Math.min(topBars, bottomBars);
             int hMin = Math.min(leftBars, rightBars);
 
-            // Only treat symmetric top+bottom OR left+right bars (never 4-sided framed covers or all-black art)
-            boolean hasLetterbox = vMin >= 2 && Math.abs(topBars - bottomBars) <= 2
-                    && (topBars + bottomBars) <= 14 && hMin == 0;
-            boolean hasPillarbox = hMin >= 2 && Math.abs(leftBars - rightBars) <= 2
-                    && (leftBars + rightBars) <= 14 && vMin == 0;
+            // Detect symmetric letterbox (top+bottom) OR pillarbox (left+right), never 4-sided framed covers or all-black art
+            boolean hasLetterbox = vMin >= 3 && Math.abs(topBars - bottomBars) <= 4
+                    && (topBars + bottomBars) <= 42 && hMin <= 1;
+            boolean hasPillarbox = hMin >= 3 && Math.abs(leftBars - rightBars) <= 4
+                    && (leftBars + rightBars) <= 42 && vMin <= 1;
 
             if (hasLetterbox) {
-                int yStart = topBars;
-                int yEnd = n - bottomBars;
-                if (hasNonBlackInterior(ambientScratchPixels, 0, yStart, n, yEnd, n)) {
-                    lastArtActiveHFrac = Math.max(0.50f, (yEnd - yStart) / (float) n);
+                // Trim 1 extra row per side to clear JPEG/scaling edge bleed
+                int yStart = Math.min(n / 2 - 4, topBars + 1);
+                int yEnd = Math.max(n / 2 + 4, n - bottomBars - 1);
+                if (hasNonBlackInterior(artBarScratchPixels, 0, yStart, n, yEnd, n)) {
+                    return new float[]{0f, yStart / (float) n, 1f, yEnd / (float) n};
                 }
             } else if (hasPillarbox) {
-                int xStart = leftBars;
-                int xEnd = n - rightBars;
-                if (hasNonBlackInterior(ambientScratchPixels, xStart, 0, xEnd, n, n)) {
-                    lastArtActiveWFrac = Math.max(0.50f, (xEnd - xStart) / (float) n);
+                int xStart = Math.min(n / 2 - 4, leftBars + 1);
+                int xEnd = Math.max(n / 2 + 4, n - rightBars - 1);
+                if (hasNonBlackInterior(artBarScratchPixels, xStart, 0, xEnd, n, n)) {
+                    return new float[]{xStart / (float) n, 0f, xEnd / (float) n, 1f};
                 }
             }
+            return new float[]{0f, 0f, 1f, 1f};
         } catch (Throwable ignored) {
-            try {
-                drawable.setBounds(ambientSavedBounds);
-            } catch (Throwable ignored2) {}
+            if (boundsMutated) {
+                try {
+                    sampleTarget.setBounds(artBarSavedBounds);
+                } catch (Throwable ignored2) {}
+            }
+            return new float[]{0f, 0f, 1f, 1f};
         }
     }
 
     private static boolean isSampleRowBlack(int[] pixels, int y, int n) {
         int black = 0;
-        int total = n - 2;
+        int total = n - 4;
         int row = y * n;
-        for (int x = 1; x < n - 1; x++) {
+        for (int x = 2; x < n - 2; x++) {
             int px = pixels[row + x];
-            if (Color.alpha(px) >= 180 && Color.red(px) <= 16 && Color.green(px) <= 16 && Color.blue(px) <= 16) {
+            if (Color.alpha(px) >= 160 && Color.red(px) <= 30 && Color.green(px) <= 30 && Color.blue(px) <= 30) {
                 black++;
             }
         }
-        return black >= Math.round(total * 0.92f);
+        return black >= Math.round(total * 0.88f);
     }
 
     private static boolean isSampleColBlack(int[] pixels, int x, int n) {
         int black = 0;
-        int total = n - 2;
-        for (int y = 1; y < n - 1; y++) {
+        int total = n - 4;
+        for (int y = 2; y < n - 2; y++) {
             int px = pixels[y * n + x];
-            if (Color.alpha(px) >= 180 && Color.red(px) <= 16 && Color.green(px) <= 16 && Color.blue(px) <= 16) {
+            if (Color.alpha(px) >= 160 && Color.red(px) <= 30 && Color.green(px) <= 30 && Color.blue(px) <= 30) {
                 black++;
             }
         }
-        return black >= Math.round(total * 0.92f);
+        return black >= Math.round(total * 0.88f);
     }
 
     private static boolean hasNonBlackInterior(int[] pixels, int x0, int y0, int x1, int y1, int n) {
@@ -2117,12 +2248,12 @@ public final class M3NavigationFilter {
             for (int x = x0; x < x1; x++) {
                 int px = pixels[row + x];
                 total++;
-                if (Color.red(px) > 22 || Color.green(px) > 22 || Color.blue(px) > 22) {
+                if (Color.red(px) > 36 || Color.green(px) > 36 || Color.blue(px) > 36) {
                     lit++;
                 }
             }
         }
-        return total > 0 && (lit / (float) total) >= 0.18f;
+        return total > 0 && (lit / (float) total) >= 0.16f;
     }
 
     private static void restoreSquareAlbumArtCrop() {
@@ -2130,6 +2261,7 @@ public final class M3NavigationFilter {
             ImageView iv = e.getKey();
             if (iv != null) {
                 if (e.getValue() != null) iv.setScaleType(e.getValue());
+                iv.setImageMatrix(null);
                 iv.setScaleX(1f);
                 iv.setScaleY(1f);
             }
@@ -2151,9 +2283,8 @@ public final class M3NavigationFilter {
             }
         }
         origArtGroupClips.clear();
-        lastArtBarSig = 0;
-        lastArtActiveWFrac = 1f;
-        lastArtActiveHFrac = 1f;
+        artBarBoundsCache.clear();
+        artBarSigCache.clear();
     }
 
     private static void hideNativeMiniplayerProgressResidue(View playerPage, int overlayW, float pillH) {
@@ -2812,6 +2943,7 @@ public final class M3NavigationFilter {
     private static void updateNowPlayingAmbient(
             View playerPage,
             @Nullable View artContainer,
+            int overlayW,
             int overlayH,
             float collapseRatio,
             boolean isPlayerParkedEmpty,
@@ -2850,6 +2982,32 @@ public final class M3NavigationFilter {
                     ViewGroup.LayoutParams.MATCH_PARENT
             ));
             ambientViewRef = new WeakReference<>(ambientView);
+        }
+
+        // Extend ambient view full-bleed past any paddingBottom/gesture-bar inset so no dark horizontal strip appears at the bottom
+        if (ambientHost.getClipToPadding()) ambientHost.setClipToPadding(false);
+        if (ambientHost.getClipChildren()) ambientHost.setClipChildren(false);
+        int wantW = Math.max(ambientHost.getWidth(), overlayW);
+        int wantH = Math.max(ambientHost.getHeight(), overlayH);
+        if (wantW > 0 && wantH > 0) {
+            if (ambientView.getLeft() != 0) ambientView.setLeft(0);
+            if (ambientView.getTop() != 0) ambientView.setTop(0);
+            if (ambientView.getRight() < wantW) ambientView.setRight(wantW);
+            if (ambientView.getBottom() < wantH) ambientView.setBottom(wantH);
+        }
+
+        // Prevent Android / One UI translucent navigation bar contrast scrim from painting a 54px dark strip over the bottom of ambient glow
+        if (collapseRatio < 0.25f) {
+            Activity act = resolveActivity(playerPage.getContext());
+            if (act != null && act.getWindow() != null) {
+                Window w = act.getWindow();
+                if (w.getNavigationBarColor() != Color.TRANSPARENT) {
+                    w.setNavigationBarColor(Color.TRANSPARENT);
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && w.isNavigationBarContrastEnforced()) {
+                    w.setNavigationBarContrastEnforced(false);
+                }
+            }
         }
 
         float ambientAlpha = Math.max(0f, Math.min(1f, (0.85f - collapseRatio) / 0.85f));
