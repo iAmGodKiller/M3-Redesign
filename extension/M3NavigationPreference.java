@@ -260,9 +260,9 @@ public class M3NavigationPreference extends Preference {
                 "Hide the redundant floating Play button inside playlists",
                 null));
 
-        // Category 1b: Now Playing Ambient Mode (live-applied without restart)
+        // Category 1b: Now Playing & Album Art (live-applied without restart)
         PreferenceCategory ambientCat = new PreferenceCategory(context);
-        ambientCat.setTitle("Now Playing ambient mode");
+        ambientCat.setTitle("Now Playing & album art");
         screen.addPreference(ambientCat);
 
         m3DependentPrefs.add(addSwitch(context, ambientCat,
@@ -275,9 +275,14 @@ public class M3NavigationPreference extends Preference {
         Preference ambientIntensityPref = addSliderPreference(context, ambientCat,
                 M3NavigationFilter.AMBIENT_INTENSITY_PCT,
                 "Ambient glow intensity",
-                25, 100, "%", false);
+                0, 100, "%", false);
         ambientIntensityPrefHolder[0] = ambientIntensityPref;
         m3DependentPrefs.add(ambientIntensityPref);
+
+        m3DependentPrefs.add(addSliderPreference(context, ambientCat,
+                M3NavigationFilter.ALBUM_ART_RADIUS_DP,
+                "Album art corner radius",
+                0, 36, "dp", false));
 
         // Category 2: Wavy Search Button
         PreferenceCategory searchCat = new PreferenceCategory(context);
