@@ -284,13 +284,12 @@ public final class M3NavigationFilter {
     private static float lastRawArtTy = Float.NaN;
     private static float lastSetArtTx = Float.NaN;
     private static float lastSetArtTy = Float.NaN;
-    private static float restArtOffsetX = 0f;
-    private static float restArtOffsetY = 0f;
-    private static boolean hasRestArtOffset = false;
+    private static float stockRestArtTx = 0f;
+    private static float stockRestArtTy = 0f;
+    private static float stockRestArtScale = 1f;
+    private static boolean hasStockRestArt = false;
     private static float lastRawArtScale = 1f;
     private static float lastSetArtScale = Float.NaN;
-    private static float restArtScaleRatio = 1f;
-    private static boolean hasRestArtScale = false;
     @Nullable private static ViewOutlineProvider origArtOutlineProvider = null;
     private static boolean origArtClipToOutline = false;
     private static WeakReference<View> origArtOutlineTargetRef = new WeakReference<>(null);
@@ -1405,7 +1404,7 @@ public final class M3NavigationFilter {
             float rawBv = readRawBv(wwl);
             if (pageTop <= dpToPx(4f)) {
                 collapseRatio = 0f;
-            } else if (!Float.isNaN(rawBv) && rawBv >= 0.995f && pageTop > overlayH * 0.45f) {
+            } else if (!Float.isNaN(rawBv) && rawBv >= 0.9995f && pageTop > overlayH * 0.45f) {
                 restingCollapsedTop = pageTop;
                 collapseRatio = 1f;
             } else if (!Float.isNaN(rawBv) && rawBv >= 0f && rawBv <= 1f) {
@@ -1417,8 +1416,8 @@ public final class M3NavigationFilter {
                 float denom = (restingCollapsedTop > 0f) ? restingCollapsedTop : (pivotTop - pillH);
                 collapseRatio = Math.max(0f, Math.min(1f, pageTop / Math.max(1f, denom)));
             }
-            if (collapseRatio < 0.004f) collapseRatio = 0f;
-            if (collapseRatio > 0.996f) collapseRatio = 1f;
+            if (collapseRatio < 0.0005f) collapseRatio = 0f;
+            if (collapseRatio > 0.9995f) collapseRatio = 1f;
         }
 
         boolean isMinimized = showFallbackMini || collapseRatio >= 0.99f;
@@ -1739,17 +1738,17 @@ public final class M3NavigationFilter {
             float curTx = artContainer.getTranslationX();
             float curTy = artContainer.getTranslationY();
             float curSx = artContainer.getScaleX();
-            if (Float.isNaN(lastSetArtTx) || Math.abs(curTx - lastSetArtTx) > 0.5f) {
+            if (Float.isNaN(lastSetArtTx) || Math.abs(curTx - lastSetArtTx) > 1e-4f) {
                 lastRawArtTx = curTx;
             }
-            if (Float.isNaN(lastSetArtTy) || Math.abs(curTy - lastSetArtTy) > 0.5f) {
+            if (Float.isNaN(lastSetArtTy) || Math.abs(curTy - lastSetArtTy) > 1e-4f) {
                 lastRawArtTy = curTy;
             }
-            if (Float.isNaN(lastSetArtScale) || Math.abs(curSx - lastSetArtScale) > 0.005f) {
+            if (Float.isNaN(lastSetArtScale) || Math.abs(curSx - lastSetArtScale) > 1e-5f) {
                 lastRawArtScale = curSx;
             }
 
-            if (collapseRatio <= 0.004f || isPlayerParkedEmpty) {
+            if (collapseRatio <= 0.0005f || isPlayerParkedEmpty) {
                 // Leave Now Playing album art completely untouched so audio/video switching and native styling remain intact
                 if (artContainer.getAlpha() != 1f) {
                     artContainer.setAlpha(1f);
@@ -1761,13 +1760,13 @@ public final class M3NavigationFilter {
                     lastSetArtScale = Float.NaN;
                 }
                 if (!Float.isNaN(lastSetArtTx)) {
-                    if (Math.abs(curTx - lastSetArtTx) <= 0.5f && !Float.isNaN(lastRawArtTx)) {
+                    if (Math.abs(curTx - lastSetArtTx) <= 1e-4f && !Float.isNaN(lastRawArtTx)) {
                         artContainer.setTranslationX(lastRawArtTx);
                     }
                     lastSetArtTx = Float.NaN;
                 }
                 if (!Float.isNaN(lastSetArtTy)) {
-                    if (Math.abs(curTy - lastSetArtTy) <= 0.5f && !Float.isNaN(lastRawArtTy)) {
+                    if (Math.abs(curTy - lastSetArtTy) <= 1e-4f && !Float.isNaN(lastRawArtTy)) {
                         artContainer.setTranslationY(lastRawArtTy);
                     }
                     lastSetArtTy = Float.NaN;
@@ -1798,63 +1797,69 @@ public final class M3NavigationFilter {
 
                 float miniCornerPx = dpToPx(Math.max(0, Math.min(28, prefMiniArtRadiusDp)));
 
-                if (collapseRatio >= 0.99f) {
-                    float targetMinScale = (miniSide > 0)
-                            ? Math.max(0.08f, Math.min(4.0f, artSize / (float) miniSide))
-                            : 1f;
-                    restArtScaleRatio = targetMinScale / Math.max(0.05f, lastRawArtScale);
-                    hasRestArtScale = true;
+                // Always compute live target resting transform for the current track (no stale cached offsets across songs)
+                float rawTx = Float.isNaN(lastRawArtTx) ? curTx : lastRawArtTx;
+                float rawTy = Float.isNaN(lastRawArtTy) ? curTy : lastRawArtTy;
+                float rawScale = Math.max(0.05f, lastRawArtScale);
 
-                    artContainer.setPivotX(0f);
-                    artContainer.setPivotY(0f);
-                    artContainer.setScaleX(targetMinScale);
-                    artContainer.setScaleY(targetMinScale);
-                    lastSetArtScale = targetMinScale;
+                float targetMinScale = (miniSide > 0)
+                        ? Math.max(0.08f, Math.min(4.0f, artSize / (float) miniSide))
+                        : 1f;
+                float visualSide = (miniSide > 0) ? (miniSide * targetMinScale) : artSize;
+                float targetMinTx = miniL + artInset - artContainer.getLeft() - miniCropL * targetMinScale;
+                float targetMinTy = Math.max(0f, (pillH - visualSide) * 0.5f) - artContainer.getTop() - miniCropT * targetMinScale;
 
-                    float visualSide = (miniSide > 0) ? (miniSide * targetMinScale) : artSize;
-                    float targetMinTx = miniL + artInset - miniCropL * targetMinScale;
-                    float targetMinTy = Math.max(0f, (pillH - visualSide) * 0.5f) - miniCropT * targetMinScale;
-                    restArtOffsetX = targetMinTx - lastRawArtTx;
-                    restArtOffsetY = targetMinTy - lastRawArtTy;
-                    hasRestArtOffset = true;
+                // Record WatchWhileLayout's true settled resting transform only once collapseRatio reaches 1.0
+                if (collapseRatio >= 0.9995f) {
+                    stockRestArtScale = rawScale;
+                    stockRestArtTx = rawTx;
+                    stockRestArtTy = rawTy;
+                    hasStockRestArt = true;
+                }
 
-                    artContainer.setTranslationX(targetMinTx);
-                    artContainer.setTranslationY(targetMinTy);
-                    lastSetArtTx = targetMinTx;
-                    lastSetArtTy = targetMinTy;
+                // Single C1-continuous curve from expanded (0.0) to minimized (1.0) with zero 0.99f snap cliff
+                float appliedScale;
+                float appliedTx;
+                float appliedTy;
+                if (hasStockRestArt) {
+                    float liveScaleRatio = targetMinScale / Math.max(0.05f, stockRestArtScale);
+                    float liveOffsetX = targetMinTx - stockRestArtTx;
+                    float liveOffsetY = targetMinTy - stockRestArtTy;
 
-                    if (miniSide > 0) {
-                        float localCornerPx = miniCornerPx / Math.max(0.08f, targetMinScale);
-                        applyMiniArtOutline(artContainer, miniCropL, miniCropT, miniCropR, miniCropB, localCornerPx);
-                    }
+                    float baseScale = rawScale * lerp(1f, liveScaleRatio, collapseRatio);
+                    float baseTx = rawTx + liveOffsetX * collapseRatio;
+                    float baseTy = rawTy + liveOffsetY * collapseRatio;
+
+                    float endBlend = smoothstep(0.94f, 1.0f, collapseRatio);
+                    appliedScale = lerp(baseScale, targetMinScale, endBlend);
+                    appliedTx = lerp(baseTx, targetMinTx, endBlend);
+                    appliedTy = lerp(baseTy, targetMinTy, endBlend);
                 } else {
-                    float appliedScale = lastRawArtScale;
-                    if (hasRestArtScale) {
-                        appliedScale = lastRawArtScale * lerp(1f, restArtScaleRatio, collapseRatio);
-                        artContainer.setPivotX(0f);
-                        artContainer.setPivotY(0f);
-                        artContainer.setScaleX(appliedScale);
-                        artContainer.setScaleY(appliedScale);
-                        lastSetArtScale = appliedScale;
-                    }
-                    if (hasRestArtOffset) {
-                        float desiredTx = lastRawArtTx + restArtOffsetX * collapseRatio;
-                        float desiredTy = lastRawArtTy + restArtOffsetY * collapseRatio;
-                        artContainer.setTranslationX(desiredTx);
-                        artContainer.setTranslationY(desiredTy);
-                        lastSetArtTx = desiredTx;
-                        lastSetArtTy = desiredTy;
-                    }
-                    if (miniSide > 0 && collapseRatio > 0.02f) {
-                        int cl = Math.round(lerp(0f, miniCropL, collapseRatio));
-                        int ct = Math.round(lerp(0f, miniCropT, collapseRatio));
-                        int cr = Math.round(lerp(artW, miniCropR, collapseRatio));
-                        int cb = Math.round(lerp(artH, miniCropB, collapseRatio));
-                        float localCornerPx = miniCornerPx / Math.max(0.08f, appliedScale);
-                        applyMiniArtOutline(artContainer, cl, ct, cr, cb, localCornerPx);
-                    } else {
-                        restoreArtOutline(artContainer);
-                    }
+                    float blend = smoothstep(0f, 1f, collapseRatio);
+                    appliedScale = lerp(rawScale, targetMinScale, blend);
+                    appliedTx = lerp(rawTx, targetMinTx, blend);
+                    appliedTy = lerp(rawTy, targetMinTy, blend);
+                }
+
+                artContainer.setPivotX(0f);
+                artContainer.setPivotY(0f);
+                artContainer.setScaleX(appliedScale);
+                artContainer.setScaleY(appliedScale);
+                artContainer.setTranslationX(appliedTx);
+                artContainer.setTranslationY(appliedTy);
+                lastSetArtScale = appliedScale;
+                lastSetArtTx = appliedTx;
+                lastSetArtTy = appliedTy;
+
+                if (miniSide > 0 && collapseRatio > 0.02f) {
+                    int cl = Math.round(lerp(0f, miniCropL, collapseRatio));
+                    int ct = Math.round(lerp(0f, miniCropT, collapseRatio));
+                    int cr = Math.round(lerp(artW, miniCropR, collapseRatio));
+                    int cb = Math.round(lerp(artH, miniCropB, collapseRatio));
+                    float localCornerPx = miniCornerPx / Math.max(0.08f, appliedScale);
+                    applyMiniArtOutline(artContainer, cl, ct, cr, cb, localCornerPx);
+                } else {
+                    restoreArtOutline(artContainer);
                 }
             }
         }
@@ -2394,10 +2399,9 @@ public final class M3NavigationFilter {
         lastRawArtTy = Float.NaN;
         lastSetArtTx = Float.NaN;
         lastSetArtTy = Float.NaN;
-        hasRestArtOffset = false;
+        hasStockRestArt = false;
         lastRawArtScale = 1f;
         lastSetArtScale = Float.NaN;
-        hasRestArtScale = false;
 
         if (playerPage != null) {
             playerPage.setAlpha(1f);
@@ -3435,6 +3439,11 @@ public final class M3NavigationFilter {
 
     private static float lerp(float a, float b, float t) {
         return a + (b - a) * t;
+    }
+
+    private static float smoothstep(float edge0, float edge1, float x) {
+        float t = Math.max(0f, Math.min(1f, (x - edge0) / Math.max(1e-6f, edge1 - edge0)));
+        return t * t * (3f - 2f * t);
     }
 
     private static int withAlpha(int rgb, int alpha) {
