@@ -31,8 +31,12 @@ import android.graphics.Typeface;
 import android.graphics.drawable.BitmapDrawable;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
+import android.graphics.drawable.DrawableWrapper;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.LayerDrawable;
+import android.graphics.drawable.PaintDrawable;
+import android.graphics.drawable.RippleDrawable;
+import android.graphics.drawable.ShapeDrawable;
 import android.media.AudioManager;
 import android.os.Build;
 import android.os.SystemClock;
@@ -251,6 +255,12 @@ public final class M3NavigationFilter {
     private static WeakReference<NowPlayingAmbientView> ambientViewRef = new WeakReference<>(null);
     private static final Set<View> hiddenNativeFabs = Collections.newSetFromMap(new WeakHashMap<>());
     private static final Set<View> hiddenNativeBars = Collections.newSetFromMap(new WeakHashMap<>());
+    private static final Map<Drawable, Integer> mutedMiniDrawables = new WeakHashMap<>();
+    private static final Set<View> hiddenMiniOverlayViews = Collections.newSetFromMap(new WeakHashMap<>());
+    private static final Set<View> disabledMiniFadingEdgeViews = Collections.newSetFromMap(new WeakHashMap<>());
+    private static final Set<View> clippedMiniSwipeContainers = Collections.newSetFromMap(new WeakHashMap<>());
+    private static final Set<View> hiddenMiniSubtitles = Collections.newSetFromMap(new WeakHashMap<>());
+    private static final Rect tmpMiniClipRect = new Rect();
 
     private static WeakReference<ViewGroup> pivotBarRef = new WeakReference<>(null);
     private static WeakReference<View> homeTabRef = new WeakReference<>(null);
@@ -1190,8 +1200,9 @@ public final class M3NavigationFilter {
         Drawable bg = view.getBackground();
         if (bg instanceof ColorDrawable cd) {
             int c = cd.getColor();
-            if (Color.alpha(c) > 80 && (c & 0x00FFFFFF) != 0 && (c & 0x00FFFFFF) != 0x00FFFFFF) {
-                return c;
+            if ((Color.alpha(c) > 80 || mutedMiniDrawables.containsKey(bg))
+                    && (c & 0x00FFFFFF) != 0 && (c & 0x00FFFFFF) != 0x00FFFFFF) {
+                return c | 0xFF000000;
             }
         } else if (bg instanceof GradientDrawable gd && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             int[] colors = gd.getColors();
@@ -1712,6 +1723,15 @@ public final class M3NavigationFilter {
                     waveView.update(trackProgress, isPlaying, contentColor);
                 }
             }
+        }
+
+        // 5b. Clean right-side swipe residue gradient / controls backdrop & hide all swipe-item singer names
+        if (collapseRatio > 0.05f && !isPlayerParkedEmpty) {
+            cleanMiniplayerSwipeArtifacts(
+                    playerPage, stockMini, artContainer, playBtn, titleTv, pillH, contentColor
+            );
+        } else {
+            restoreMiniSwipeVisualArtifacts();
         }
 
         // 6. Miniplayer-only album art alignment, square-crop & rounded corners (Now Playing stays 100% untouched)
@@ -2349,7 +2369,7 @@ public final class M3NavigationFilter {
         int top = 0;
         View cur = view;
         int hops = 0;
-        while (cur != null && cur != playerPage && hops < 12) {
+        while (cur != null && cur != playerPage && hops < 16) {
             top += cur.getTop();
             ViewParent p = cur.getParent();
             if (!(p instanceof View pv)) return false;
@@ -2410,6 +2430,9 @@ public final class M3NavigationFilter {
         }
         hiddenNativeBars.clear();
 
+        restoreMiniSwipeVisualArtifacts();
+        restoreHiddenMiniSubtitles();
+
         MiniBlurBackdropView blurView = miniBlurViewRef.get();
         if (blurView != null) blurView.setVisibility(View.GONE);
         NowPlayingAmbientView ambientView = ambientViewRef.get();
@@ -2432,6 +2455,539 @@ public final class M3NavigationFilter {
             subRow.setVisibility(View.VISIBLE);
             subtitle.setVisibility(View.VISIBLE);
         }
+    }
+
+    private static void cleanMiniplayerSwipeArtifacts(
+            View playerPage,
+            ViewGroup stockMini,
+            @Nullable View artContainer,
+            @Nullable ImageView playBtn,
+            @Nullable TextView primaryTitleTv,
+            float pillH,
+            int contentColor
+    ) {
+        int maxBandY = Math.round(pillH + dpToPx(20f));
+        boolean hasPlayBounds = false;
+        int playScreenL = 0;
+        int playScreenR = 0;
+        if (playBtn != null && playBtn.getWidth() > 0 && playBtn.getHeight() > 0 && playBtn.isShown()) {
+            playBtn.getLocationOnScreen(tmpLoc);
+            playScreenL = tmpLoc[0];
+            playScreenR = playScreenL + playBtn.getWidth();
+            hasPlayBounds = true;
+        }
+
+        // Mute any opaque/gradient backdrop on playBtn and its controls container chain up to playerPage
+        View chain = playBtn;
+        int chainHops = 0;
+        while (chain != null && chain != playerPage && chainHops < 8) {
+            muteViewBackdropsForMini(chain);
+            disableSolidMiniFadingEdge(chain);
+            ViewParent p = chain.getParent();
+            chain = (p instanceof View pv) ? pv : null;
+            chainHops++;
+        }
+
+        List<TextView> bandTextViews = new ArrayList<>();
+        View topSection = (PLAYER_TOP_SECTION_ID != 0) ? playerPage.findViewById(PLAYER_TOP_SECTION_ID) : null;
+        if (topSection != null) {
+            scanMiniSwipeArtifactsRecursive(
+                    topSection, playerPage, stockMini, artContainer, playBtn,
+                    maxBandY, pillH, hasPlayBounds, playScreenL, playScreenR,
+                    false, bandTextViews, 0, 10
+            );
+        }
+        if (topSection == null || !isDescendantOf(stockMini, topSection)) {
+            scanMiniSwipeArtifactsRecursive(
+                    stockMini, playerPage, stockMini, artContainer, playBtn,
+                    maxBandY, pillH, hasPlayBounds, playScreenL, playScreenR,
+                    false, bandTextViews, 0, 10
+            );
+        }
+
+        // Also check direct overlay children of playerPage in the miniplayer band (e.g. standalone gradient scrims)
+        if (playerPage instanceof ViewGroup ppVg) {
+            for (int i = 0; i < ppVg.getChildCount(); i++) {
+                View child = ppVg.getChildAt(i);
+                if (child == null || child == topSection || child == stockMini || child == artContainer
+                        || child instanceof MiniBlurBackdropView
+                        || child instanceof MiniWaveSeekBarView
+                        || child instanceof NowPlayingAmbientView) {
+                    continue;
+                }
+                if (isInsideMiniplayerBand(child, playerPage, maxBandY)) {
+                    String resName = getSafeResEntryName(child);
+                    if (isMiniGradientOrScrimName(resName)
+                            || (!(child instanceof ViewGroup) && !(child instanceof TextView) && !child.isClickable())) {
+                        suppressMiniOverlayView(child);
+                    }
+                }
+            }
+        }
+
+        // Hide ALL singer/artist subtitle views across resting miniplayer and horizontal swipe transition pages
+        if (!prefShowWaveSeekbar) {
+            restoreHiddenMiniSubtitles();
+            for (TextView tv : bandTextViews) {
+                if (isExplicitMiniSubtitle(tv)) {
+                    tv.setTextColor(withAlpha(contentColor, 190));
+                    tv.setSingleLine(true);
+                    tv.setMaxLines(1);
+                    tv.setEllipsize(TextUtils.TruncateAt.END);
+                }
+            }
+            return;
+        }
+
+        // 1. Re-enforce any previously tracked subtitle views that YouTube Music re-showed on bind/swipe
+        for (View prevSub : hiddenMiniSubtitles) {
+            if (prevSub != null && prevSub.getVisibility() != View.GONE) {
+                prevSub.setVisibility(View.GONE);
+            }
+        }
+
+        // 2. Hide all explicit subtitle/artist/byline TextViews (works before layout & across all swipe ViewHolders)
+        for (TextView tv : bandTextViews) {
+            if (isExplicitMiniSubtitle(tv)) {
+                hideMiniSubtitleAndRow(tv, primaryTitleTv);
+            }
+        }
+
+        // 3. Structural check: hide secondary TextView rows inside vertical LinearLayouts (catches obfuscated/NO_ID swipe items)
+        for (TextView tv : bandTextViews) {
+            if (tv.getVisibility() == View.GONE || isExplicitMiniTitle(tv)) continue;
+            if (isSecondaryTextInVerticalStack(tv)) {
+                hideMiniSubtitleAndRow(tv, primaryTitleTv);
+            }
+        }
+
+        // 4. Coordinate check: hide any TextView positioned vertically underneath another TextView in the same column
+        int count = bandTextViews.size();
+        if (count >= 2) {
+            int[] rects = new int[count * 4];
+            boolean[] valid = new boolean[count];
+            for (int i = 0; i < count; i++) {
+                TextView tv = bandTextViews.get(i);
+                if (tv.getVisibility() == View.VISIBLE && tv.getWidth() > 0 && tv.getHeight() > 0) {
+                    tv.getLocationOnScreen(tmpLoc);
+                    rects[i * 4] = tmpLoc[0];
+                    rects[i * 4 + 1] = tmpLoc[1];
+                    rects[i * 4 + 2] = tmpLoc[0] + tv.getWidth();
+                    rects[i * 4 + 3] = tmpLoc[1] + tv.getHeight();
+                    valid[i] = true;
+                }
+            }
+            float minTopDelta = dpToPx(6f);
+            float maxBottomOverlap = dpToPx(8f);
+            float horizSlop = dpToPx(12f);
+            for (int i = 0; i < count; i++) {
+                if (!valid[i]) continue;
+                TextView tvB = bandTextViews.get(i);
+                if (tvB.getVisibility() == View.GONE || isExplicitMiniTitle(tvB)) continue;
+                int bL = rects[i * 4];
+                int bT = rects[i * 4 + 1];
+                int bR = rects[i * 4 + 2];
+                for (int j = 0; j < count; j++) {
+                    if (i == j || !valid[j]) continue;
+                    TextView tvA = bandTextViews.get(j);
+                    if (tvA.getVisibility() != View.VISIBLE || TextUtils.isEmpty(tvA.getText())) continue;
+                    int aL = rects[j * 4];
+                    int aT = rects[j * 4 + 1];
+                    int aR = rects[j * 4 + 2];
+                    int aB = rects[j * 4 + 3];
+                    boolean isBelow = bT >= aT + minTopDelta && bT >= aB - maxBottomOverlap;
+                    boolean overlapsX = Math.min(aR, bR) > Math.max(aL, bL) - horizSlop;
+                    if (isBelow && overlapsX) {
+                        hideMiniSubtitleAndRow(tvB, primaryTitleTv);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    private static void scanMiniSwipeArtifactsRecursive(
+            View view,
+            View playerPage,
+            ViewGroup stockMini,
+            @Nullable View artContainer,
+            @Nullable ImageView playBtn,
+            int maxBandY,
+            float pillH,
+            boolean hasPlayBounds,
+            int playScreenL,
+            int playScreenR,
+            boolean hasClippedSwipeAncestor,
+            List<TextView> bandTextViews,
+            int depth,
+            int maxDepth
+    ) {
+        if (view == null || depth > maxDepth) return;
+        if (view instanceof MiniBlurBackdropView
+                || view instanceof MiniWaveSeekBarView
+                || view instanceof NowPlayingAmbientView) {
+            return;
+        }
+        int id = view.getId();
+        if (view == artContainer || (id != View.NO_ID && (id == WATCH_FRAGMENT_CONTAINER_ID || id == MINI_SPACER_ID))) {
+            return;
+        }
+
+        boolean inBand = isInsideMiniplayerBand(view, playerPage, maxBandY);
+        if (view instanceof ViewGroup vg) {
+            boolean clippedHere = hasClippedSwipeAncestor;
+            if (inBand) {
+                muteViewBackdropsForMini(vg);
+                disableSolidMiniFadingEdge(vg);
+
+                // If a swipe container extends behind playBtn, clip its drawing right at playBtn's left edge
+                // so track text never collides with the play icon after removing the opaque maroon backdrop
+                if (!clippedHere && hasPlayBounds && playBtn != null
+                        && vg != playBtn && !isDescendantOf(playBtn, vg)
+                        && (artContainer == null || (vg != artContainer && !isDescendantOf(artContainer, vg)))
+                        && vg.getVisibility() == View.VISIBLE && vg.getWidth() > 0 && vg.getHeight() > 0) {
+                    String cls = vg.getClass().getName();
+                    boolean looksLikeSwipeHost = cls.contains("RecyclerView")
+                            || cls.contains("ViewPager")
+                            || cls.contains("HorizontalScrollView")
+                            || cls.contains("Swipe")
+                            || (vg.getParent() == stockMini && containsAnyTextView(vg, 0));
+                    if (looksLikeSwipeHost) {
+                        vg.getLocationOnScreen(tmpLoc);
+                        int vL = tmpLoc[0];
+                        int vR = vL + vg.getWidth();
+                        if (vL < playScreenL - dpToPx(8f) && vR > playScreenL + dpToPx(2f)) {
+                            int clipW = Math.max(0, playScreenL - vL);
+                            int sx = vg.getScrollX();
+                            int sy = vg.getScrollY();
+                            int targetR = sx + clipW;
+                            int targetB = sy + vg.getHeight();
+                            boolean needsUpdate = true;
+                            if (vg.getClipBounds(tmpMiniClipRect)) {
+                                needsUpdate = tmpMiniClipRect.left != sx || tmpMiniClipRect.top != sy
+                                        || tmpMiniClipRect.right != targetR || tmpMiniClipRect.bottom != targetB;
+                            }
+                            if (needsUpdate) {
+                                tmpMiniClipRect.set(sx, sy, targetR, targetB);
+                                vg.setClipBounds(tmpMiniClipRect);
+                            }
+                            clippedMiniSwipeContainers.add(vg);
+                            clippedHere = true;
+                        } else if (clippedMiniSwipeContainers.remove(vg)) {
+                            vg.setClipBounds(null);
+                        }
+                    }
+                }
+            }
+            for (int i = 0; i < vg.getChildCount(); i++) {
+                scanMiniSwipeArtifactsRecursive(
+                        vg.getChildAt(i), playerPage, stockMini, artContainer, playBtn,
+                        maxBandY, pillH, hasPlayBounds, playScreenL, playScreenR,
+                        clippedHere, bandTextViews, depth + 1, maxDepth
+                );
+            }
+            return;
+        }
+
+        if (!inBand) return;
+        if (view instanceof SurfaceView || view instanceof TextureView) return;
+        disableSolidMiniFadingEdge(view);
+
+        if (view instanceof TextView tv) {
+            muteViewBackdropsForMini(tv);
+            bandTextViews.add(tv);
+            return;
+        }
+
+        if (view == playBtn || (id != View.NO_ID && id == PLAY_PAUSE_ID)) {
+            muteViewBackdropsForMini(view);
+            return;
+        }
+        if (view instanceof ProgressBar) return;
+
+        muteViewBackdropsForMini(view);
+        String resName = getSafeResEntryName(view);
+        if (isMiniGradientOrScrimName(resName)) {
+            suppressMiniOverlayView(view);
+            return;
+        }
+
+        if (view instanceof ImageView iv) {
+            Drawable imgD = iv.getDrawable();
+            if (imgD instanceof GradientDrawable
+                    || imgD instanceof ColorDrawable
+                    || imgD instanceof ShapeDrawable
+                    || imgD instanceof PaintDrawable) {
+                suppressMiniOverlayView(iv);
+                return;
+            }
+            int w = iv.getWidth();
+            int h = iv.getHeight();
+            // Tall narrow vertical gradient strip (e.g. fade_right drawable next to play button)
+            if (w > 0 && h > 0 && w <= Dim.dp(48) && h >= pillH * 0.55f && h >= w * 1.2f) {
+                suppressMiniOverlayView(iv);
+                return;
+            }
+            if (iv.isClickable()) return;
+            // Non-art overlay ImageView sitting over/right next to playBtn (never touch swipe-item album art)
+            if (hasPlayBounds && w > 0 && h > 0 && !isSiblingOfTextView(iv)) {
+                iv.getLocationOnScreen(tmpLoc);
+                int vL = tmpLoc[0];
+                int vR = vL + w;
+                if (vL >= playScreenL - Dim.dp(24) && vR >= playScreenL + Dim.dp(8) && vR <= playScreenR + Dim.dp(24)) {
+                    suppressMiniOverlayView(iv);
+                }
+            }
+        } else if (!view.isClickable()) {
+            // Non-clickable plain or custom leaf View (gradient/scrim/fade overlay)
+            if (view.getClass() != View.class || view.getBackground() != null
+                    || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && view.getForeground() != null)) {
+                suppressMiniOverlayView(view);
+            }
+        }
+    }
+
+    private static void muteViewBackdropsForMini(View view) {
+        Drawable bg = view.getBackground();
+        if (bg != null) {
+            muteDrawableForMini(bg);
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            Drawable fg = view.getForeground();
+            if (fg != null) {
+                muteDrawableForMini(fg);
+            }
+        }
+    }
+
+    private static void muteDrawableForMini(@Nullable Drawable d) {
+        muteDrawableForMini(d, 0);
+    }
+
+    private static void muteDrawableForMini(@Nullable Drawable d, int depth) {
+        if (d == null || depth > 6) return;
+        if (d instanceof RippleDrawable rd) {
+            for (int i = 0; i < rd.getNumberOfLayers(); i++) {
+                if (rd.getId(i) == android.R.id.mask) continue;
+                muteDrawableForMini(rd.getDrawable(i), depth + 1);
+            }
+            return;
+        }
+        Drawable m = d.mutate();
+        if (!mutedMiniDrawables.containsKey(m)) {
+            int origAlpha = m.getAlpha();
+            mutedMiniDrawables.put(m, origAlpha > 0 ? origAlpha : 255);
+        }
+        if (m.getAlpha() != 0) {
+            m.setAlpha(0);
+        }
+        if (m instanceof LayerDrawable ld) {
+            for (int i = 0; i < ld.getNumberOfLayers(); i++) {
+                if (ld.getId(i) == android.R.id.mask) continue;
+                muteDrawableForMini(ld.getDrawable(i), depth + 1);
+            }
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && m instanceof DrawableWrapper dw) {
+            muteDrawableForMini(dw.getDrawable(), depth + 1);
+        } else {
+            Drawable current = m.getCurrent();
+            if (current != null && current != m) {
+                muteDrawableForMini(current, depth + 1);
+            }
+        }
+    }
+
+    private static void suppressMiniOverlayView(View v) {
+        muteViewBackdropsForMini(v);
+        if (v instanceof ImageView iv && iv.getDrawable() != null) {
+            muteDrawableForMini(iv.getDrawable());
+        }
+        v.setClipBounds(EMPTY_CLIP);
+        hiddenMiniOverlayViews.add(v);
+    }
+
+    private static void disableSolidMiniFadingEdge(View v) {
+        if (v.isHorizontalFadingEdgeEnabled() && (v instanceof ViewGroup || v.getSolidColor() != 0)) {
+            v.setHorizontalFadingEdgeEnabled(false);
+            disabledMiniFadingEdgeViews.add(v);
+        }
+    }
+
+    private static void restoreMiniSwipeVisualArtifacts() {
+        if (!mutedMiniDrawables.isEmpty()) {
+            for (Map.Entry<Drawable, Integer> e : mutedMiniDrawables.entrySet()) {
+                Drawable d = e.getKey();
+                Integer origAlpha = e.getValue();
+                if (d != null && origAlpha != null) {
+                    try {
+                        d.setAlpha(origAlpha);
+                    } catch (Throwable ignored) {}
+                }
+            }
+            mutedMiniDrawables.clear();
+        }
+        if (!hiddenMiniOverlayViews.isEmpty()) {
+            for (View v : hiddenMiniOverlayViews) {
+                if (v != null) v.setClipBounds(null);
+            }
+            hiddenMiniOverlayViews.clear();
+        }
+        if (!disabledMiniFadingEdgeViews.isEmpty()) {
+            for (View v : disabledMiniFadingEdgeViews) {
+                if (v != null) v.setHorizontalFadingEdgeEnabled(true);
+            }
+            disabledMiniFadingEdgeViews.clear();
+        }
+        if (!clippedMiniSwipeContainers.isEmpty()) {
+            for (View v : clippedMiniSwipeContainers) {
+                if (v != null) v.setClipBounds(null);
+            }
+            clippedMiniSwipeContainers.clear();
+        }
+    }
+
+    private static void restoreHiddenMiniSubtitles() {
+        if (!hiddenMiniSubtitles.isEmpty()) {
+            for (View v : hiddenMiniSubtitles) {
+                if (v != null && v.getVisibility() != View.VISIBLE) {
+                    v.setVisibility(View.VISIBLE);
+                }
+            }
+            hiddenMiniSubtitles.clear();
+        }
+    }
+
+    private static String getSafeResEntryName(View view) {
+        int id = view.getId();
+        if (id == View.NO_ID) return "";
+        try {
+            return view.getResources().getResourceEntryName(id).toLowerCase();
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
+    private static boolean isMiniGradientOrScrimName(String resName) {
+        if (resName.isEmpty()) return false;
+        return resName.contains("gradient")
+                || resName.contains("fade")
+                || resName.contains("scrim")
+                || resName.contains("shadow")
+                || resName.contains("mask")
+                || resName.contains("veil")
+                || resName.contains("backdrop")
+                || resName.contains("curtain")
+                || resName.contains("bleed")
+                || (resName.contains("overlay") && !resName.contains("overlay_elements"));
+    }
+
+    private static boolean isExplicitMiniTitle(TextView tv) {
+        int id = tv.getId();
+        if (TITLE_ID != 0 && id == TITLE_ID) return true;
+        String name = getSafeResEntryName(tv);
+        return name.contains("title") && !name.contains("sub");
+    }
+
+    private static boolean isExplicitMiniSubtitle(TextView tv) {
+        int id = tv.getId();
+        if (SUBTITLE_ID != 0 && id == SUBTITLE_ID) return true;
+        String name = getSafeResEntryName(tv);
+        return name.contains("subtitle")
+                || name.contains("sub_title")
+                || name.contains("artist")
+                || name.contains("byline")
+                || name.contains("secondary")
+                || name.contains("second_line")
+                || name.contains("author")
+                || name.contains("channel");
+    }
+
+    private static boolean isSecondaryTextInVerticalStack(TextView tv) {
+        ViewParent p = tv.getParent();
+        if (p instanceof LinearLayout ll && ll.getOrientation() == LinearLayout.VERTICAL) {
+            int idx = ll.indexOfChild(tv);
+            for (int i = 0; i < idx; i++) {
+                if (containsAnyTextView(ll.getChildAt(i), 0)) return true;
+            }
+        } else if (p instanceof ViewGroup row && row.getParent() instanceof LinearLayout ll
+                && ll.getOrientation() == LinearLayout.VERTICAL) {
+            int idx = ll.indexOfChild(row);
+            for (int i = 0; i < idx; i++) {
+                if (containsAnyTextView(ll.getChildAt(i), 0)) return true;
+            }
+        }
+        return false;
+    }
+
+    private static void hideMiniSubtitleAndRow(TextView subTv, @Nullable TextView primaryTitleTv) {
+        if (subTv.getVisibility() != View.GONE) {
+            subTv.setVisibility(View.GONE);
+        }
+        hiddenMiniSubtitles.add(subTv);
+        ViewParent parent = subTv.getParent();
+        if (parent instanceof ViewGroup subRow) {
+            int rowId = subRow.getId();
+            boolean isSharedColumn = (primaryTitleTv != null && subRow == primaryTitleTv.getParent())
+                    || (rowId != View.NO_ID && (rowId == MINI_PLAYER_ID || rowId == PLAYER_TOP_SECTION_ID))
+                    || containsOtherTextView(subRow, subTv, 0)
+                    || containsWavePlayOrArt(subRow, 0);
+            if (!isSharedColumn) {
+                if (subRow.getVisibility() != View.GONE) {
+                    subRow.setVisibility(View.GONE);
+                }
+                hiddenMiniSubtitles.add(subRow);
+            }
+        }
+    }
+
+    private static boolean containsAnyTextView(@Nullable View v, int depth) {
+        if (v == null || depth > 4) return false;
+        if (v instanceof TextView) return true;
+        if (v instanceof ViewGroup vg) {
+            for (int i = 0; i < vg.getChildCount(); i++) {
+                if (containsAnyTextView(vg.getChildAt(i), depth + 1)) return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean containsOtherTextView(@Nullable View v, TextView exclude, int depth) {
+        if (v == null || depth > 4) return false;
+        if (v instanceof TextView && v != exclude) return true;
+        if (v instanceof ViewGroup vg) {
+            for (int i = 0; i < vg.getChildCount(); i++) {
+                if (containsOtherTextView(vg.getChildAt(i), exclude, depth + 1)) return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean containsWavePlayOrArt(@Nullable View v, int depth) {
+        if (v == null || depth > 4) return false;
+        if (v instanceof MiniWaveSeekBarView) return true;
+        int id = v.getId();
+        if (id != View.NO_ID && (id == PLAY_PAUSE_ID || id == WATCH_FRAGMENT_CONTAINER_ID || id == MINI_SPACER_ID)) {
+            return true;
+        }
+        if (v instanceof ImageView && v.getWidth() >= Dim.dp(24) && v.getHeight() >= Dim.dp(24)) {
+            return true;
+        }
+        if (v instanceof ViewGroup vg) {
+            for (int i = 0; i < vg.getChildCount(); i++) {
+                if (containsWavePlayOrArt(vg.getChildAt(i), depth + 1)) return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isSiblingOfTextView(View v) {
+        ViewParent p = v.getParent();
+        if (p instanceof ViewGroup vg) {
+            for (int i = 0; i < vg.getChildCount(); i++) {
+                View child = vg.getChildAt(i);
+                if (child != v && containsAnyTextView(child, 0)) return true;
+            }
+        }
+        return false;
     }
 
     private static void setViewVisibilityById(ViewGroup root, int id, int vis) {
