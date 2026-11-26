@@ -2,6 +2,10 @@
 
 A standalone **Material 3 Expressive** navigation bar and miniplayer redesign add-on patch for **YouTube Music**, built for the [Morphe](https://github.com/MorpheApp/morphe-patches) patcher ecosystem.
 
+[![Add to Morphe Manager](https://img.shields.io/badge/Add%20to-Morphe%20Manager-1E88E5?style=for-the-badge)](https://morphe.software/add-source?github=iAmGodKiller/M3-Redesign)
+
+**Direct Morphe Manager link:** [https://morphe.software/add-source?github=iAmGodKiller/M3-Redesign](https://morphe.software/add-source?github=iAmGodKiller/M3-Redesign)
+
 **Author:** `iAmGodKiller`  
 **Included Patches:**
 - **`M3 Redesign addon`** *(stable — off by default after patching; enable in Morphe Settings)*
@@ -24,13 +28,10 @@ A standalone **Material 3 Expressive** navigation bar and miniplayer redesign ad
 
 ## Installation (Morphe Manager)
 
-### Method 1 — Add as a Remote Patch Source (Recommended)
-1. Open **Morphe Manager** → **Patch Sources** → **Add Source**.
-2. Paste this repository URL:
-   ```text
-   https://github.com/iAmGodKiller/M3-Redesign
-   ```
-   *(Or open via deeplink: `morphe://sources/add?url=https://github.com/iAmGodKiller/M3-Redesign`)*
+### Method 1 — One-Tap Add in Morphe Manager (Recommended)
+1. On your Android device with **Morphe Manager** installed, tap this link to open it directly in Morphe Manager:  
+   **[Add M3-Redesign to Morphe Manager](https://morphe.software/add-source?github=iAmGodKiller/M3-Redesign)**
+2. Confirm adding the patch source when prompted (or add it manually in **Morphe Manager → Patch Sources → Add Source** by pasting `https://github.com/iAmGodKiller/M3-Redesign`).
 3. Keep the official **Morphe** patches source enabled alongside **M3-Redesign**.
 4. Select **M3 Redesign addon** with your usual YouTube Music patches and patch YouTube Music.
 5. Open the patched YouTube Music app → **Settings → Morphe → M3 Redesign addon** → turn on **Enable M3 Redesign addon** and restart.
