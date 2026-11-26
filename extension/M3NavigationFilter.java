@@ -2643,7 +2643,7 @@ public final class M3NavigationFilter {
                 // If a swipe container extends behind playBtn, clip its drawing right at playBtn's left edge
                 // so track text never collides with the play icon after removing the opaque maroon backdrop
                 if (!clippedHere && hasPlayBounds && playBtn != null
-                        && vg != playBtn && !isDescendantOf(playBtn, vg)
+                        && !isDescendantOf(playBtn, vg)
                         && (artContainer == null || (vg != artContainer && !isDescendantOf(artContainer, vg)))
                         && vg.getVisibility() == View.VISIBLE && vg.getWidth() > 0 && vg.getHeight() > 0) {
                     String cls = vg.getClass().getName();
