@@ -8,8 +8,9 @@ A standalone **Material 3 Expressive** navigation bar and miniplayer redesign ad
 
 **Author:** `iAmGodKiller`  
 **Included Patches:**
-- **`M3 Redesign addon`** *(stable — off by default after patching; enable in Morphe Settings)*
-- **`Transparent status bar`** *(pre-release / `dev` channel only — enable **Use pre-releases** in Morphe Manager to test)*
+- **`M3 Redesign addon`** *(YouTube Music, stable — off by default after patching; enable in Morphe Settings)*
+- **`Remove top black bar`** *(YouTube, stable — standalone edge-to-edge patch for portrait video playback on tablets & phones when hiding the status bar)*
+- **`Transparent status bar`** *(YouTube Music, pre-release / `dev` channel only — enable **Use pre-releases** in Morphe Manager to test)*
 
 ---
 
@@ -33,12 +34,12 @@ A standalone **Material 3 Expressive** navigation bar and miniplayer redesign ad
    **[Add M3-Redesign to Morphe Manager](https://morphe.software/add-source?github=iAmGodKiller/M3-Redesign)**
 2. Confirm adding the patch source when prompted (or add it manually in **Morphe Manager → Patch Sources → Add Source** by pasting `https://github.com/iAmGodKiller/M3-Redesign`).
 3. Keep the official **Morphe** patches source enabled alongside **M3-Redesign**.
-4. Select **M3 Redesign addon** with your usual YouTube Music patches and patch YouTube Music.
-5. Open the patched YouTube Music app → **Settings → Morphe → M3 Redesign addon** → turn on **Enable M3 Redesign addon** and restart.
+4. **For YouTube Music:** Select **M3 Redesign addon** with your usual YouTube Music patches, patch YouTube Music, then open **Settings → Morphe → M3 Redesign addon** and enable it.
+5. **For YouTube:** Select **Remove top black bar** alongside your usual YouTube patches (including Morphe's **Hide status bar** if desired) and patch YouTube.
 
 ### Method 2 — Manual `.mpp` File
 1. Download the latest `M3-Redesign-v*.mpp` from the **[Releases](https://github.com/iAmGodKiller/M3-Redesign/releases)** page.
-2. In **Morphe Manager**, add the downloaded `.mpp` file alongside the official Morphe patches and patch YouTube Music.
+2. In **Morphe Manager**, add the downloaded `.mpp` file alongside the official Morphe patches and patch YouTube Music or YouTube.
 
 ---
 
@@ -95,8 +96,9 @@ The standalone bundle and patch list will be generated in `dist/`:
 M3-Redesign/
 ├── .github/workflows/build-and-release.yml   # Automated CI build & GitHub Release / Pre-release workflow
 ├── build-config/                             # Standalone Gradle & ProGuard overlays
-├── extension/                                # Stable Java runtime extension (M3NavigationFilter & M3NavigationPreference)
-├── patch/                                    # Stable Kotlin Morphe patch & bytecode fingerprints
+├── extension/                                # Stable YouTube Music Java extension (M3NavigationFilter & M3NavigationPreference)
+├── patch/                                    # Stable YouTube Music Kotlin Morphe patch & bytecode fingerprints
+├── youtube/                                  # Standalone YouTube patch & extension (Remove top black bar)
 ├── prerelease/                               # Pre-release patches & extensions (e.g. Transparent status bar)
 ├── scripts/
 │   ├── build-local.sh                        # One-command local build script (stable & pre-release)

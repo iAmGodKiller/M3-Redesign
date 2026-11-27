@@ -43,6 +43,8 @@ kotlin {
                     "app/morphe/patches/music/misc/playservice/**",
                     "app/morphe/patches/music/shared/Constants.kt",
                     "app/morphe/patches/music/misc/gms/Constants.kt",
+                    "app/morphe/patches/youtube/layout/fullscreen/**",
+                    "app/morphe/patches/youtube/shared/Constants.kt",
                     "app/morphe/patches/all/misc/version/**",
                     "app/morphe/util/**"
                 )

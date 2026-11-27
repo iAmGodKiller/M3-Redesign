@@ -12,3 +12,5 @@
 
 -dontwarn app.morphe.extension.music.**
 -keep class app.morphe.extension.music.patches.miniplayer.** { *; }
+-dontwarn app.morphe.extension.youtube.**
+-keep class app.morphe.extension.youtube.patches.fullscreen.** { *; }
