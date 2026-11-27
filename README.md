@@ -10,7 +10,7 @@ A standalone **Material 3 Expressive** navigation bar and miniplayer redesign ad
 **Included Patches:**
 - **`M3 Redesign addon`** *(YouTube Music, stable — off by default after patching; enable in Morphe Settings)*
 - **`Remove top black bar`** *(YouTube, stable — standalone edge-to-edge patch for portrait video playback on tablets & phones when hiding the status bar)*
-- **`Scroll away home toolbar`** *(YouTube, stable — makes the Home screen top toolbar scroll away like the top of the page instead of staying persistent)*
+- **`Scroll away home toolbar`** *(YouTube, stable — makes YouTube's top toolbar scroll away like the top of the page everywhere across Home, Subscriptions, Library, and sub-pages instead of staying persistent)*
 - **`Swap profile photo with Library icon`** *(YouTube, stable — replaces the You tab channel profile photo in the navigation bar with a theme-aware Library icon)*
 - **`Glass navigation bar blur`** *(YouTube, stable — adds an adjustable blur strength slider and clean-edge toggle in Morphe Navigation settings for the glass navigation bar)*
 - **`Transparent status bar (YouTube)`** *(YouTube, stable — keeps the status bar visible while removing the gray translucent background/scrim behind it during scrolling)*

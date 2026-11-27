@@ -291,7 +291,7 @@ val removeTopBlackBarPatch = patch(
 @Suppress("unused")
 val scrollAwayHomeToolbarPatch = patch(
     name = "Scroll away home toolbar",
-    description = "Makes the YouTube Home screen top toolbar act like the top of the page so it scrolls away cleanly with the feed instead of staying persistent or popping back mid-page.",
+    description = "Makes YouTube's top toolbar act like the top of the page everywhere across the app (Home, Subscriptions, Library, Channels, and more) so it scrolls away cleanly with the feed instead of staying persistent or popping back mid-page.",
     default = false
 ) {
     compatibleWith(COMPATIBILITY_YOUTUBE_ANY)
@@ -307,7 +307,6 @@ val scrollAwayHomeToolbarPatch = patch(
             )
         }
 
-        hookPivotBarEnumTrackingIfNeeded()
         hookPivotBarTabSelectedIfNeeded()
     }
 }
