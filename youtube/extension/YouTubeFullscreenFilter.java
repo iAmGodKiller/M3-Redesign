@@ -8,13 +8,9 @@ import android.graphics.Insets;
 import android.graphics.Rect;
 import android.os.Build;
 import android.os.Bundle;
-import android.os.SystemClock;
 import android.view.DisplayCutout;
-import android.view.SurfaceView;
-import android.view.TextureView;
 import android.view.View;
 import android.view.ViewGroup;
-import android.view.ViewParent;
 import android.view.ViewTreeObserver;
 import android.view.Window;
 import android.view.WindowInsets;
@@ -32,20 +28,18 @@ import java.util.HashMap;
 import java.util.WeakHashMap;
 
 /**
- * Independent YouTube fullscreen & Home toolbar helper:
- * 1. Removes the black status-bar gap above YouTube videos on tablets and phones without adding
- *    per-frame scroll overhead (no OnPreDrawListener, all IDs & reflection handles cached once).
- * 2. Optionally configures the YouTube Home AppBarLayout children to SCROLL_FLAG_SCROLL (0x1) so
- *    the top toolbar behaves as the top of the page and scrolls away cleanly instead of staying
- *    persistent or popping back mid-page.
+ * Independent YouTube fullscreen & Home toolbar helper engineered for zero scroll overhead:
+ * - Zero per-frame hooks (no OnPreDrawListener, no OnGlobalLayoutListener during scroll).
+ * - Zero view-tree walks, findViewById calls, reflection, or LayoutParams mutations during scroll.
+ * - Purely event-driven: runs only on Activity lifecycle, window focus, window resize/rotation,
+ *   WindowInsets dispatch, and idle (top == 0) AppBarLayout chrome updates.
  */
 @SuppressWarnings("unused")
 public final class YouTubeFullscreenFilter {
 
     private static final int SCROLL_FLAG_SCROLL = 0x1;
-    private static final long LAYOUT_CHECK_MIN_INTERVAL_MS = 280L;
-    private static final long TRAILING_CHECK_DELAY_MS = 220L;
-    private static final long SURFACE_FALLBACK_SCAN_INTERVAL_MS = 900L;
+    private static final long APPBAR_UPDATE_DEBOUNCE_MS = 60L;
+    private static final int MAX_COLD_START_RETRIES = 4;
 
     private static final String[] WATCH_CONTAINER_NAMES = {
             "next_gen_watch_container",
@@ -64,14 +58,6 @@ public final class YouTubeFullscreenFilter {
             "status_bar_tint"
     };
 
-    private static final String[] PLAYER_CONTAINER_NAMES = {
-            "player_fragment_container",
-            "next_gen_watch_player",
-            "watch_player",
-            "player_view",
-            "player_overlays"
-    };
-
     private static final String[] APP_BAR_NAMES = {
             "appbar_layout",
             "app_bar_layout",
@@ -88,18 +74,28 @@ public final class YouTubeFullscreenFilter {
 
     private static final WeakHashMap<Activity, ActivityState> STATES = new WeakHashMap<>();
     private static final HashMap<Class<?>, ScrollFlagsAccessor> SCROLL_FLAGS_CACHE = new HashMap<>();
+    private static final HashMap<Class<?>, Method> TOOLBAR_GET_TITLE_CACHE = new HashMap<>();
     private static final ScrollFlagsAccessor NO_ACCESSOR = new ScrollFlagsAccessor(null, null, null);
+    private static final Method NO_METHOD;
+
+    static {
+        Method sentinel = null;
+        try {
+            sentinel = Object.class.getMethod("toString");
+        } catch (Throwable ignored) {
+        }
+        NO_METHOD = sentinel;
+    }
 
     private static volatile boolean removeTopBlackBarEnabled = false;
     private static volatile boolean homeScrollToolbarEnabled = false;
     private static volatile boolean lifecycleRegistered = false;
     private static volatile WeakReference<Activity> currentActivityRef = new WeakReference<>(null);
 
-    // Process-wide cached resource IDs (resolved ONCE, never on scroll frames).
+    // Process-wide cached resource IDs (resolved once, never during scroll).
     private static volatile boolean idsResolved = false;
     private static int[] watchContainerIds = new int[0];
     private static int[] statusBarSpacerIds = new int[0];
-    private static int[] playerContainerIds = new int[0];
     private static int[] appBarIds = new int[0];
     private static int[] navBarIds = new int[0];
     private static int cachedStatusBarHeightPx = -1;
@@ -144,34 +140,23 @@ public final class YouTubeFullscreenFilter {
     }
 
     private static final class ActivityState {
-        boolean listenersInstalled = false;
-        int lastDecorW = -1;
-        int lastDecorH = -1;
-        long lastLayoutCheckMs = 0L;
-        long lastSurfaceScanMs = 0L;
-        boolean trailingCheckScheduled = false;
-
-        int appliedShiftPx = 0;
-        WeakReference<View> shiftedViewRef = new WeakReference<>(null);
-        int originalShiftedHeight = ViewGroup.LayoutParams.MATCH_PARENT;
+        boolean decorListenersInstalled = false;
+        boolean sysStatusBgSearched = false;
+        int coldStartRetries = 0;
 
         WeakReference<View> cachedSysStatusBgRef = new WeakReference<>(null);
         WeakReference<View> cachedWatchContainerRef = new WeakReference<>(null);
-        WeakReference<View> cachedPlayerViewRef = new WeakReference<>(null);
         WeakReference<ViewGroup> cachedAppBarRef = new WeakReference<>(null);
         WeakReference<ViewGroup> cachedNavBarRef = new WeakReference<>(null);
-        int lastAppBarChildCount = -1;
-        boolean appBarLayoutListenerAttached = false;
+        boolean appBarListenerAttached = false;
 
         final WeakHashMap<View, Integer> originalScrollFlags = new WeakHashMap<>();
 
-        ViewTreeObserver.OnGlobalLayoutListener globalLayoutListener;
+        View.OnLayoutChangeListener decorResizeListener;
         ViewTreeObserver.OnWindowFocusChangeListener focusChangeListener;
         View.OnLayoutChangeListener appBarLayoutChangeListener;
-        Runnable trailingCheckRunnable;
-
-        final int[] tmpLocA = new int[2];
-        final int[] tmpLocB = new int[2];
+        Runnable debouncedAppBarRunnable;
+        Runnable coldStartRetryRunnable;
     }
 
     private YouTubeFullscreenFilter() {
@@ -370,7 +355,6 @@ public final class YouTubeFullscreenFilter {
             }
             watchContainerIds = resolveIdArray(res, pkg, WATCH_CONTAINER_NAMES);
             statusBarSpacerIds = resolveIdArray(res, pkg, STATUS_BAR_SPACER_NAMES);
-            playerContainerIds = resolveIdArray(res, pkg, PLAYER_CONTAINER_NAMES);
             appBarIds = resolveIdArray(res, pkg, APP_BAR_NAMES);
             navBarIds = resolveIdArray(res, pkg, NAV_BAR_NAMES);
             cachedStatusBarHeightPx = readStatusBarHeightPx(res);
@@ -406,11 +390,15 @@ public final class YouTubeFullscreenFilter {
         if (state == null) {
             return;
         }
-        restoreShift(state);
         try {
             ViewGroup appBar = state.cachedAppBarRef.get();
-            if (appBar != null && state.appBarLayoutChangeListener != null) {
-                appBar.removeOnLayoutChangeListener(state.appBarLayoutChangeListener);
+            if (appBar != null) {
+                if (state.appBarLayoutChangeListener != null) {
+                    appBar.removeOnLayoutChangeListener(state.appBarLayoutChangeListener);
+                }
+                if (state.debouncedAppBarRunnable != null) {
+                    appBar.removeCallbacks(state.debouncedAppBarRunnable);
+                }
             }
         } catch (Throwable ignored) {
         }
@@ -423,17 +411,15 @@ public final class YouTubeFullscreenFilter {
             if (decor == null) {
                 return;
             }
-            if (state.trailingCheckRunnable != null) {
-                decor.removeCallbacks(state.trailingCheckRunnable);
+            if (state.coldStartRetryRunnable != null) {
+                decor.removeCallbacks(state.coldStartRetryRunnable);
+            }
+            if (state.decorResizeListener != null) {
+                decor.removeOnLayoutChangeListener(state.decorResizeListener);
             }
             ViewTreeObserver vto = decor.getViewTreeObserver();
-            if (vto != null && vto.isAlive()) {
-                if (state.globalLayoutListener != null) {
-                    vto.removeOnGlobalLayoutListener(state.globalLayoutListener);
-                }
-                if (state.focusChangeListener != null) {
-                    vto.removeOnWindowFocusChangeListener(state.focusChangeListener);
-                }
+            if (vto != null && vto.isAlive() && state.focusChangeListener != null) {
+                vto.removeOnWindowFocusChangeListener(state.focusChangeListener);
             }
         } catch (Throwable ignored) {
         }
@@ -446,12 +432,8 @@ public final class YouTubeFullscreenFilter {
         resolveResourceIdsOnce(activity.getResources(), activity.getPackageName());
 
         final ActivityState state = getState(activity);
-        if (removeTopBlackBarEnabled) {
-            if (isFloatingOrSplitMode(activity)) {
-                restoreShift(state);
-            } else {
-                configureWindow(activity);
-            }
+        if (removeTopBlackBarEnabled && !isFloatingOrSplitMode(activity)) {
+            configureWindow(activity);
         }
 
         Window window = activity.getWindow();
@@ -463,9 +445,9 @@ public final class YouTubeFullscreenFilter {
             return;
         }
 
-        installLayoutWatchers(activity, decor, state);
+        installDecorEventListeners(activity, decor, state);
 
-        // Post inset stripper & initial toolbar setup so we attach AFTER upstream Morphe's
+        // Post inset stripper & toolbar setup so we attach AFTER upstream Morphe's
         // HideStatusBarPatch.addDisplayCutoutInset listener on android.R.id.content.
         final WeakReference<Activity> actRef = new WeakReference<>(activity);
         decor.post(new Runnable() {
@@ -475,17 +457,104 @@ public final class YouTubeFullscreenFilter {
                 if (act == null || act.isFinishing() || act.isDestroyed()) {
                     return;
                 }
-                if (removeTopBlackBarEnabled) {
-                    if (isFloatingOrSplitMode(act)) {
-                        restoreShift(state);
-                    } else {
-                        configureWindow(act);
-                        installInsetStrippers(act);
-                    }
-                }
-                runLightCheck(act, state, true);
+                applyEventDrivenFixes(act, state);
             }
         });
+    }
+
+    private static void installDecorEventListeners(Activity activity, final View decor, final ActivityState state) {
+        if (state.decorListenersInstalled) {
+            return;
+        }
+        final WeakReference<Activity> actRef = new WeakReference<>(activity);
+
+        // Fires ONLY when the window dimensions actually change (rotation, fullscreen toggle,
+        // or split-screen resize). Never does any work during feed scrolling.
+        state.decorResizeListener = new View.OnLayoutChangeListener() {
+            @Override
+            public void onLayoutChange(
+                    View v,
+                    int left, int top, int right, int bottom,
+                    int oldLeft, int oldTop, int oldRight, int oldBottom
+            ) {
+                int newW = right - left;
+                int newH = bottom - top;
+                int oldW = oldRight - oldLeft;
+                int oldH = oldBottom - oldTop;
+                if (newW == oldW && newH == oldH) {
+                    return;
+                }
+                Activity act = actRef.get();
+                if (act == null || act.isFinishing() || act.isDestroyed()) {
+                    return;
+                }
+                if (removeTopBlackBarEnabled && !isFloatingOrSplitMode(act)) {
+                    configureWindow(act);
+                    cleanRootTopInsets(act, state);
+                }
+                if (homeScrollToolbarEnabled) {
+                    attachAndSyncAppBar(act, state);
+                }
+            }
+        };
+        decor.addOnLayoutChangeListener(state.decorResizeListener);
+
+        ViewTreeObserver vto = decor.getViewTreeObserver();
+        if (vto != null && vto.isAlive()) {
+            state.focusChangeListener = new ViewTreeObserver.OnWindowFocusChangeListener() {
+                @Override
+                public void onWindowFocusChanged(boolean hasFocus) {
+                    if (!hasFocus) {
+                        return;
+                    }
+                    Activity act = actRef.get();
+                    if (act == null || act.isFinishing() || act.isDestroyed()) {
+                        return;
+                    }
+                    applyEventDrivenFixes(act, state);
+                }
+            };
+            vto.addOnWindowFocusChangeListener(state.focusChangeListener);
+        }
+
+        state.decorListenersInstalled = true;
+    }
+
+    private static void applyEventDrivenFixes(Activity activity, final ActivityState state) {
+        if (removeTopBlackBarEnabled && !isFloatingOrSplitMode(activity)) {
+            configureWindow(activity);
+            installInsetStrippers(activity, state);
+            cleanRootTopInsets(activity, state);
+        }
+
+        if (homeScrollToolbarEnabled) {
+            boolean attached = attachAndSyncAppBar(activity, state);
+            if (!attached && state.coldStartRetries < MAX_COLD_START_RETRIES) {
+                Window window = activity.getWindow();
+                final View decor = window != null ? window.getDecorView() : null;
+                if (decor != null) {
+                    state.coldStartRetries++;
+                    final WeakReference<Activity> actRef = new WeakReference<>(activity);
+                    if (state.coldStartRetryRunnable != null) {
+                        decor.removeCallbacks(state.coldStartRetryRunnable);
+                    }
+                    state.coldStartRetryRunnable = new Runnable() {
+                        @Override
+                        public void run() {
+                            Activity act = actRef.get();
+                            if (act == null || act.isFinishing() || act.isDestroyed()) {
+                                return;
+                            }
+                            if (!attachAndSyncAppBar(act, state) && state.coldStartRetries < MAX_COLD_START_RETRIES) {
+                                state.coldStartRetries++;
+                                decor.postDelayed(this, 450L);
+                            }
+                        }
+                    };
+                    decor.postDelayed(state.coldStartRetryRunnable, 450L);
+                }
+            }
+        }
     }
 
     @SuppressWarnings("deprecation")
@@ -569,7 +638,7 @@ public final class YouTubeFullscreenFilter {
         }
     }
 
-    private static void installInsetStrippers(Activity activity) {
+    private static void installInsetStrippers(Activity activity, final ActivityState state) {
         if (!removeTopBlackBarEnabled) {
             return;
         }
@@ -593,6 +662,7 @@ public final class YouTubeFullscreenFilter {
                     if (v.getPaddingTop() != 0) {
                         v.setPadding(v.getPaddingLeft(), 0, v.getPaddingRight(), v.getPaddingBottom());
                     }
+                    hideSysStatusBgIfPresent(v, state);
                     return v.onApplyWindowInsets(stripped);
                 }
             });
@@ -740,142 +810,23 @@ public final class YouTubeFullscreenFilter {
         }
     }
 
-    private static void installLayoutWatchers(Activity activity, final View decor, final ActivityState state) {
-        if (state.listenersInstalled) {
-            return;
-        }
-        ViewTreeObserver vto = decor.getViewTreeObserver();
-        if (vto == null || !vto.isAlive()) {
-            return;
-        }
-        final WeakReference<Activity> actRef = new WeakReference<>(activity);
-
-        state.trailingCheckRunnable = new Runnable() {
-            @Override
-            public void run() {
-                state.trailingCheckScheduled = false;
-                Activity act = actRef.get();
-                if (act == null || act.isFinishing() || act.isDestroyed()) {
-                    return;
-                }
-                runLightCheck(act, state, false);
-            }
-        };
-
-        // Zero-jitter global layout watcher:
-        // - Never runs OnPreDrawListener (0 callbacks per scroll frame).
-        // - Never calls configureWindow() unless window dimensions actually change.
-        // - Throttles to at most once every 280ms during scroll, with a single coalesced trailing check.
-        state.globalLayoutListener = new ViewTreeObserver.OnGlobalLayoutListener() {
-            @Override
-            public void onGlobalLayout() {
-                Activity act = actRef.get();
-                if (act == null || act.isFinishing() || act.isDestroyed()) {
-                    return;
-                }
-                int w = decor.getWidth();
-                int h = decor.getHeight();
-                if (w <= 0 || h <= 0) {
-                    return;
-                }
-                boolean sizeChanged = (w != state.lastDecorW || h != state.lastDecorH);
-                long now = SystemClock.uptimeMillis();
-                if (!sizeChanged && (now - state.lastLayoutCheckMs) < LAYOUT_CHECK_MIN_INTERVAL_MS) {
-                    if (!state.trailingCheckScheduled && state.trailingCheckRunnable != null) {
-                        state.trailingCheckScheduled = true;
-                        decor.postDelayed(state.trailingCheckRunnable, TRAILING_CHECK_DELAY_MS);
-                    }
-                    return;
-                }
-                if (sizeChanged) {
-                    state.lastDecorW = w;
-                    state.lastDecorH = h;
-                    if (removeTopBlackBarEnabled && !isFloatingOrSplitMode(act)) {
-                        configureWindow(act);
-                    }
-                }
-                runLightCheck(act, state, sizeChanged);
-            }
-        };
-
-        state.focusChangeListener = new ViewTreeObserver.OnWindowFocusChangeListener() {
-            @Override
-            public void onWindowFocusChanged(boolean hasFocus) {
-                if (!hasFocus) {
-                    return;
-                }
-                Activity act = actRef.get();
-                if (act == null || act.isFinishing() || act.isDestroyed()) {
-                    return;
-                }
-                if (removeTopBlackBarEnabled) {
-                    if (isFloatingOrSplitMode(act)) {
-                        restoreShift(state);
-                    } else {
-                        configureWindow(act);
-                        installInsetStrippers(act);
-                    }
-                }
-                runLightCheck(act, state, true);
-            }
-        };
-
-        vto.addOnGlobalLayoutListener(state.globalLayoutListener);
-        vto.addOnWindowFocusChangeListener(state.focusChangeListener);
-        state.listenersInstalled = true;
-    }
-
-    private static void runLightCheck(Activity activity, ActivityState state, boolean forceScan) {
-        state.lastLayoutCheckMs = SystemClock.uptimeMillis();
+    /**
+     * One-shot root container cleanup executed ONLY on resume, window focus, or window resize.
+     * Never called during scrolling.
+     */
+    private static void cleanRootTopInsets(Activity activity, ActivityState state) {
         Window window = activity.getWindow();
         if (window == null) {
             return;
         }
         View decor = window.getDecorView();
-        if (decor == null || decor.getWidth() <= 0 || decor.getHeight() <= 0) {
+        if (decor == null) {
             return;
         }
 
-        boolean playerMaximized = false;
-        if (removeTopBlackBarEnabled) {
-            if (isFloatingOrSplitMode(activity)) {
-                restoreShift(state);
-            } else {
-                playerMaximized = enforceEdgeToEdgeLayout(activity, window, decor, state, forceScan);
-            }
-        }
+        int topBandPx = getTopBandPx(activity.getResources());
+        View sysStatusBg = hideSysStatusBgIfPresent(decor, state);
 
-        if (homeScrollToolbarEnabled) {
-            enforceHomeScrollToolbar(activity, window, decor, state, playerMaximized);
-        }
-    }
-
-    private static boolean enforceEdgeToEdgeLayout(
-            Activity activity,
-            Window window,
-            View decor,
-            ActivityState state,
-            boolean forceScan
-    ) {
-        Resources res = activity.getResources();
-        int topBandPx = getTopBandPx(res);
-
-        // 1. Hide Android's system statusBarBackground overlay view if present (cached).
-        View sysStatusBg = state.cachedSysStatusBgRef.get();
-        if (sysStatusBg == null || !sysStatusBg.isAttachedToWindow()) {
-            sysStatusBg = decor.findViewById(android.R.id.statusBarBackground);
-            state.cachedSysStatusBgRef = new WeakReference<>(sysStatusBg);
-        }
-        if (sysStatusBg != null) {
-            if (sysStatusBg.getVisibility() != View.GONE) {
-                sysStatusBg.setVisibility(View.GONE);
-            }
-            if (sysStatusBg.getAlpha() != 0f) {
-                sysStatusBg.setAlpha(0f);
-            }
-        }
-
-        // 2. Clear small top padding/margin on decor, decor root child, and android.R.id.content.
         clearSmallTopInsetOnView(decor, topBandPx);
         if (decor instanceof ViewGroup) {
             ViewGroup decorGroup = (ViewGroup) decor;
@@ -898,7 +849,6 @@ public final class YouTubeFullscreenFilter {
             }
         }
 
-        // 3. Clear YouTube watch/root container top padding/margin using cached integer IDs.
         View watchContainer = state.cachedWatchContainerRef.get();
         if (watchContainer == null || !watchContainer.isAttachedToWindow()) {
             watchContainer = null;
@@ -916,171 +866,73 @@ public final class YouTubeFullscreenFilter {
             clearSmallTopInsetOnView(watchContainer, topBandPx);
         }
 
-        // Collapse known status-bar spacer views only on forced scans (startup/focus/resize)
-        // or when their cached integer IDs exist.
-        if (forceScan) {
-            for (int i = 0; i < statusBarSpacerIds.length; i++) {
-                View spacer = decor.findViewById(statusBarSpacerIds[i]);
-                if (spacer != null) {
-                    collapseSpacerView(spacer, topBandPx);
-                }
+        for (int i = 0; i < statusBarSpacerIds.length; i++) {
+            View spacer = decor.findViewById(statusBarSpacerIds[i]);
+            if (spacer != null) {
+                collapseSpacerView(spacer, topBandPx);
             }
         }
-
-        // 4. Portrait maximized video player flush safety net.
-        int decorW = decor.getWidth();
-        int decorH = decor.getHeight();
-        if (decorH <= decorW) {
-            restoreShift(state);
-            return false;
-        }
-
-        View playerView = findPortraitMaximizedPlayerFast(decor, watchContainer, res, state, decorW, decorH, forceScan);
-        if (playerView == null) {
-            restoreShift(state);
-            return false;
-        }
-
-        clearAncestorTopInsets(playerView, content, topBandPx);
-
-        decor.getLocationOnScreen(state.tmpLocA);
-        playerView.getLocationOnScreen(state.tmpLocB);
-        int currentScreenGap = state.tmpLocB[1] - state.tmpLocA[1];
-        int naturalGap = currentScreenGap + state.appliedShiftPx;
-
-        if (naturalGap > 0 && naturalGap <= topBandPx) {
-            View shiftTarget = watchContainer != null ? watchContainer : playerView;
-            applyShift(state, shiftTarget, naturalGap, decorH);
-        } else {
-            restoreShift(state);
-        }
-        return true;
     }
 
-    private static View findPortraitMaximizedPlayerFast(
-            View decor,
-            View watchContainer,
-            Resources res,
-            ActivityState state,
-            int decorW,
-            int decorH,
-            boolean forceScan
-    ) {
-        int minPlayerW = (int) (decorW * 0.88f);
-        int minPlayerH = dpToPx(res, 120);
-        int maxPlayerH = (int) (decorH * 0.65f);
-
-        // Fast path 1: check previously cached player view (O(1)).
-        View cached = state.cachedPlayerViewRef.get();
-        if (cached != null && cached.isAttachedToWindow()) {
-            if (isMaximizedPortraitPlayerBox(cached, minPlayerW, minPlayerH, maxPlayerH)) {
-                return cached;
+    private static View hideSysStatusBgIfPresent(View decor, ActivityState state) {
+        View sysStatusBg = state.cachedSysStatusBgRef.get();
+        if (sysStatusBg == null && !state.sysStatusBgSearched) {
+            state.sysStatusBgSearched = true;
+            sysStatusBg = decor.findViewById(android.R.id.statusBarBackground);
+            state.cachedSysStatusBgRef = new WeakReference<>(sysStatusBg);
+        }
+        if (sysStatusBg != null) {
+            if (sysStatusBg.getVisibility() != View.GONE) {
+                sysStatusBg.setVisibility(View.GONE);
+            }
+            if (sysStatusBg.getAlpha() != 0f) {
+                sysStatusBg.setAlpha(0f);
             }
         }
-
-        // Fast path 2: check resolved integer IDs directly (never calls getIdentifier).
-        View searchRoot = watchContainer != null ? watchContainer : decor;
-        for (int i = 0; i < playerContainerIds.length; i++) {
-            View v = searchRoot.findViewById(playerContainerIds[i]);
-            if (isMaximizedPortraitPlayerBox(v, minPlayerW, minPlayerH, maxPlayerH)) {
-                state.cachedPlayerViewRef = new WeakReference<>(v);
-                return v;
-            }
-        }
-
-        // Slow fallback: only scan watchContainer (never RecyclerView/feed subtrees) and
-        // rate-limit to at most once every 900ms so scrolling Home has 0 tree-walk cost.
-        long now = SystemClock.uptimeMillis();
-        if (!forceScan && (now - state.lastSurfaceScanMs) < SURFACE_FALLBACK_SCAN_INTERVAL_MS) {
-            return null;
-        }
-        state.lastSurfaceScanMs = now;
-        if (watchContainer == null) {
-            return null;
-        }
-        View found = findPlayerSurfaceContainerRecursive(watchContainer, minPlayerW, minPlayerH, maxPlayerH, 0);
-        if (found != null) {
-            state.cachedPlayerViewRef = new WeakReference<>(found);
-        }
-        return found;
-    }
-
-    private static boolean isMaximizedPortraitPlayerBox(View v, int minW, int minH, int maxH) {
-        if (v == null || !v.isShown()) {
-            return false;
-        }
-        int w = v.getWidth();
-        int h = v.getHeight();
-        return w >= minW && h >= minH && h <= maxH;
-    }
-
-    private static View findPlayerSurfaceContainerRecursive(
-            View node,
-            int minW,
-            int minH,
-            int maxH,
-            int depth
-    ) {
-        if (node == null || depth > 10 || !node.isShown()) {
-            return null;
-        }
-        if (node instanceof SurfaceView || node instanceof TextureView) {
-            if (isMaximizedPortraitPlayerBox(node, minW, minH, maxH)) {
-                ViewParent parent = node.getParent();
-                if (parent instanceof View) {
-                    View parentView = (View) parent;
-                    if (isMaximizedPortraitPlayerBox(parentView, minW, minH, maxH)) {
-                        return parentView;
-                    }
-                }
-                return node;
-            }
-            return null;
-        }
-        if (node instanceof ViewGroup) {
-            if (isScrollableFeedContainer(node)) {
-                return null;
-            }
-            ViewGroup vg = (ViewGroup) node;
-            int count = vg.getChildCount();
-            for (int i = 0; i < count; i++) {
-                View found = findPlayerSurfaceContainerRecursive(vg.getChildAt(i), minW, minH, maxH, depth + 1);
-                if (found != null) {
-                    return found;
-                }
-            }
-        }
-        return null;
+        return sysStatusBg;
     }
 
     // -------------------------------------------------------------------------
     // Home screen scrolling toolbar ("Scroll away home toolbar" patch)
     // -------------------------------------------------------------------------
 
-    private static void enforceHomeScrollToolbar(
-            final Activity activity,
-            Window window,
-            View decor,
-            final ActivityState state,
-            boolean playerMaximized
-    ) {
-        if (playerMaximized) {
-            return;
+    private static boolean attachAndSyncAppBar(Activity activity, final ActivityState state) {
+        Window window = activity.getWindow();
+        if (window == null) {
+            return false;
         }
-
         View content = window.findViewById(android.R.id.content);
+        View decor = window.getDecorView();
         View searchRoot = content != null ? content : decor;
+        if (searchRoot == null) {
+            return false;
+        }
 
         ViewGroup appBar = findAppBarLayoutFast(searchRoot, state);
         if (appBar == null) {
-            return;
+            return false;
         }
 
-        // Attach an additive OnLayoutChangeListener once so child additions/tab switches
-        // update scrollFlags immediately without overwriting YouTube's own listeners.
-        if (!state.appBarLayoutListenerAttached) {
+        if (!state.appBarListenerAttached) {
             final WeakReference<Activity> actRef = new WeakReference<>(activity);
             final WeakReference<ViewGroup> barRef = new WeakReference<>(appBar);
+
+            state.debouncedAppBarRunnable = new Runnable() {
+                @Override
+                public void run() {
+                    Activity act = actRef.get();
+                    ViewGroup bar = barRef.get();
+                    if (act == null || bar == null || act.isFinishing() || act.isDestroyed()) {
+                        return;
+                    }
+                    // Never mutate AppBarLayout LayoutParams while scrolled off-screen mid-fling.
+                    if (bar.getTop() < 0) {
+                        return;
+                    }
+                    updateAppBarScrollFlags(act, bar, state);
+                }
+            };
+
             state.appBarLayoutChangeListener = new View.OnLayoutChangeListener() {
                 @Override
                 public void onLayoutChange(
@@ -1088,28 +940,29 @@ public final class YouTubeFullscreenFilter {
                         int left, int top, int right, int bottom,
                         int oldLeft, int oldTop, int oldRight, int oldBottom
                 ) {
-                    Activity act = actRef.get();
-                    ViewGroup bar = barRef.get();
-                    if (act == null || bar == null || act.isFinishing() || act.isDestroyed()) {
+                    // Skip while scrolled partway or fully off-screen; only sync when toolbar is
+                    // at rest at top == 0 (e.g., tab switch, Search open, sub-page navigation).
+                    if (top < 0) {
                         return;
                     }
-                    int count = bar.getChildCount();
-                    if (count != state.lastAppBarChildCount) {
-                        state.lastAppBarChildCount = count;
-                        updateAppBarScrollFlags(act, bar, state);
+                    if (state.debouncedAppBarRunnable != null) {
+                        v.removeCallbacks(state.debouncedAppBarRunnable);
+                        v.postDelayed(state.debouncedAppBarRunnable, APPBAR_UPDATE_DEBOUNCE_MS);
                     }
                 }
             };
             appBar.addOnLayoutChangeListener(state.appBarLayoutChangeListener);
-            state.appBarLayoutListenerAttached = true;
+            state.appBarListenerAttached = true;
         }
 
-        state.lastAppBarChildCount = appBar.getChildCount();
-        updateAppBarScrollFlags(activity, appBar, state);
+        if (appBar.getTop() >= 0) {
+            updateAppBarScrollFlags(activity, appBar, state);
+        }
+        return true;
     }
 
     private static void updateAppBarScrollFlags(Activity activity, ViewGroup appBar, ActivityState state) {
-        if (appBar == null || !appBar.isAttachedToWindow()) {
+        if (appBar == null || !appBar.isAttachedToWindow() || appBar.getTop() < 0) {
             return;
         }
         Window window = activity.getWindow();
@@ -1153,11 +1006,9 @@ public final class YouTubeFullscreenFilter {
     }
 
     private static boolean isHomeToolbarScreen(View decor, ViewGroup appBar, ActivityState state) {
-        // Never force-scroll away when typing in a Search EditText inside the toolbar.
         if (containsVisibleEditText(appBar, 0)) {
             return false;
         }
-        // Skip sub-pages (Notifications, History, Channel, Settings) that display a non-empty text title.
         if (hasNonHomeToolbarTitle(appBar, 0)) {
             return false;
         }
@@ -1169,8 +1020,6 @@ public final class YouTubeFullscreenFilter {
             return true;
         }
         int selectedIndex = findSelectedNavTabIndex(navBar);
-        // If we can identify the selected tab, restrict scroll-away strictly to tab 0 (Home).
-        // If no tab reports selected/activated, allow Home scroll-away by default.
         return selectedIndex <= 0;
     }
 
@@ -1220,18 +1069,41 @@ public final class YouTubeFullscreenFilter {
         if (view instanceof Toolbar) {
             return ((Toolbar) view).getTitle();
         }
-        String className = view.getClass().getName();
-        if (className.endsWith("Toolbar") || className.contains(".Toolbar")) {
-            try {
-                Method m = view.getClass().getMethod("getTitle");
-                Object res = m.invoke(view);
-                if (res instanceof CharSequence) {
-                    return (CharSequence) res;
-                }
-            } catch (Throwable ignored) {
+        Class<?> cls = view.getClass();
+        String className = cls.getName();
+        if (!className.endsWith("Toolbar") && !className.contains(".Toolbar")) {
+            return null;
+        }
+        Method m = getCachedToolbarTitleMethod(cls);
+        if (m == null) {
+            return null;
+        }
+        try {
+            Object res = m.invoke(view);
+            if (res instanceof CharSequence) {
+                return (CharSequence) res;
             }
+        } catch (Throwable ignored) {
         }
         return null;
+    }
+
+    private static Method getCachedToolbarTitleMethod(Class<?> cls) {
+        synchronized (TOOLBAR_GET_TITLE_CACHE) {
+            Method cached = TOOLBAR_GET_TITLE_CACHE.get(cls);
+            if (cached != null) {
+                return cached == NO_METHOD ? null : cached;
+            }
+        }
+        Method resolved = null;
+        try {
+            resolved = cls.getMethod("getTitle");
+        } catch (Throwable ignored) {
+        }
+        synchronized (TOOLBAR_GET_TITLE_CACHE) {
+            TOOLBAR_GET_TITLE_CACHE.put(cls, resolved != null ? resolved : NO_METHOD);
+        }
+        return resolved;
     }
 
     private static ViewGroup findAppBarLayoutFast(View root, ActivityState state) {
@@ -1239,7 +1111,7 @@ public final class YouTubeFullscreenFilter {
         if (cached != null && cached.isAttachedToWindow()) {
             return cached;
         }
-        state.appBarLayoutListenerAttached = false;
+        state.appBarListenerAttached = false;
 
         for (int i = 0; i < appBarIds.length; i++) {
             View v = root.findViewById(appBarIds[i]);
@@ -1340,7 +1212,6 @@ public final class YouTubeFullscreenFilter {
 
     private static int findSelectedNavTabIndex(ViewGroup navBar) {
         ViewGroup tabsContainer = navBar;
-        // Unwrap single-child wrappers (e.g. HorizontalScrollView -> LinearLayout tabs container).
         for (int unwrap = 0; unwrap < 3; unwrap++) {
             if (tabsContainer.getChildCount() == 1 && tabsContainer.getChildAt(0) instanceof ViewGroup) {
                 tabsContainer = (ViewGroup) tabsContainer.getChildAt(0);
@@ -1398,7 +1269,6 @@ public final class YouTubeFullscreenFilter {
     }
 
     private static ScrollFlagsAccessor resolveScrollFlagsAccessor(Class<?> lpClass) {
-        // 1. Try unobfuscated Material Components getScrollFlags() / setScrollFlags(int).
         try {
             Method getter = lpClass.getMethod("getScrollFlags");
             Method setter = lpClass.getMethod("setScrollFlags", int.class);
@@ -1408,8 +1278,6 @@ public final class YouTubeFullscreenFilter {
         } catch (Throwable ignored) {
         }
 
-        // 2. R8-obfuscated fallback: in AppBarLayout.LayoutParams (subclass of LinearLayout.LayoutParams),
-        //    scrollFlags is the ONLY non-static, non-final int field declared below LinearLayout.LayoutParams.
         Class<?> c = lpClass;
         Field uniqueIntField = null;
         int intFieldCount = 0;
@@ -1455,77 +1323,8 @@ public final class YouTubeFullscreenFilter {
     }
 
     // -------------------------------------------------------------------------
-    // Shared layout & shift helpers
+    // Shared view helpers
     // -------------------------------------------------------------------------
-
-    private static void applyShift(ActivityState state, View target, int shiftPx, int decorH) {
-        if (target == null || shiftPx <= 0) {
-            restoreShift(state);
-            return;
-        }
-        View prev = state.shiftedViewRef.get();
-        if (prev != null && prev != target) {
-            restoreShift(state);
-        }
-
-        boolean targetChanged = (prev != target);
-        if (targetChanged) {
-            ViewGroup.LayoutParams curLp = target.getLayoutParams();
-            state.originalShiftedHeight = curLp != null ? curLp.height : ViewGroup.LayoutParams.MATCH_PARENT;
-            state.shiftedViewRef = new WeakReference<>(target);
-        }
-
-        if (target.getTranslationY() != -shiftPx) {
-            target.setTranslationY(-shiftPx);
-        }
-
-        ViewGroup.LayoutParams lp = target.getLayoutParams();
-        if (lp != null && state.originalShiftedHeight == ViewGroup.LayoutParams.MATCH_PARENT) {
-            int desiredH = decorH + shiftPx;
-            if (lp.height != desiredH) {
-                lp.height = desiredH;
-                target.setLayoutParams(lp);
-            }
-        }
-        state.appliedShiftPx = shiftPx;
-    }
-
-    private static void restoreShift(ActivityState state) {
-        if (state == null) {
-            return;
-        }
-        View prev = state.shiftedViewRef.get();
-        if (prev != null && state.appliedShiftPx != 0) {
-            try {
-                if (prev.getTranslationY() != 0f) {
-                    prev.setTranslationY(0f);
-                }
-                ViewGroup.LayoutParams lp = prev.getLayoutParams();
-                if (lp != null && lp.height != state.originalShiftedHeight) {
-                    lp.height = state.originalShiftedHeight;
-                    prev.setLayoutParams(lp);
-                }
-            } catch (Throwable ignored) {
-            }
-        }
-        state.appliedShiftPx = 0;
-        state.shiftedViewRef = new WeakReference<>(null);
-        state.originalShiftedHeight = ViewGroup.LayoutParams.MATCH_PARENT;
-    }
-
-    private static void clearAncestorTopInsets(View leaf, View stopAt, int topBandPx) {
-        View cur = leaf;
-        int steps = 0;
-        while (cur != null && steps < 12) {
-            clearSmallTopInsetOnView(cur, topBandPx);
-            if (cur == stopAt) {
-                break;
-            }
-            ViewParent p = cur.getParent();
-            cur = (p instanceof View) ? (View) p : null;
-            steps++;
-        }
-    }
 
     private static void clearSmallTopInsetOnView(View v, int topBandPx) {
         if (v == null) {
