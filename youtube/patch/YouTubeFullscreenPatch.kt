@@ -7,6 +7,7 @@ import app.morphe.patcher.extensions.InstructionExtensions.addInstructions
 import app.morphe.patcher.extensions.InstructionExtensions.getInstruction
 import app.morphe.patcher.extensions.InstructionExtensions.replaceInstruction
 import app.morphe.patcher.fieldAccess
+import app.morphe.patcher.literal
 import app.morphe.patcher.methodCall
 import app.morphe.patcher.patch.ApkFileType
 import app.morphe.patcher.patch.AppTarget
@@ -19,6 +20,7 @@ import app.morphe.patcher.string
 import app.morphe.patcher.util.getReference
 import app.morphe.patcher.xml.XmlElement
 import app.morphe.patches.youtube.shared.Constants.COMPATIBILITY_YOUTUBE
+import app.morphe.util.insertLiteralOverride
 import com.android.tools.smali.dexlib2.AccessFlags
 import com.android.tools.smali.dexlib2.Opcode
 import com.android.tools.smali.dexlib2.iface.instruction.FiveRegisterInstruction
@@ -164,6 +166,15 @@ private object YtFrostedGlassDrawFingerprint : Fingerprint(
     name = "draw",
     returnType = "V",
     parameters = listOf("Landroid/graphics/Canvas;")
+)
+
+/**
+ * YouTube feature flag that colors/tints the status bar like the top bar while scrolling.
+ */
+private object YtStatusBarScrollColorFeatureFlagFingerprint : Fingerprint(
+    filters = listOf(
+        literal(45830993L)
+    )
 )
 
 private val COMPATIBILITY_YOUTUBE_ANY = Compatibility(
@@ -516,6 +527,64 @@ val glassNavBarBlurPatch = patch(
         val addOnFile = resourceFile(ADD_ON_PREFERENCES_FILE_PATH)
         if (injectedIntoPrefs && addOnFile.exists()) {
             addOnFile.delete()
+        }
+    }
+}
+
+@Suppress("unused")
+val transparentStatusBarYouTubePatch = patch(
+    name = "Transparent status bar (YouTube)",
+    description = "Makes the status bar background completely transparent while scrolling and across YouTube while keeping the status bar clock and icons visible.",
+    default = false
+) {
+    compatibleWith(COMPATIBILITY_YOUTUBE_ANY)
+    extendWith("extensions/ytfullscreen.mpe")
+
+    finalize {
+        YtFullscreenMainActivityOnCreateFingerprint.let {
+            it.clearMatch()
+            it.method.addInstruction(
+                0,
+                "invoke-static/range { p0 .. p0 }, " +
+                    "$EXTENSION_CLASS->onTransparentStatusBarEnabled(Landroid/app/Activity;)V"
+            )
+        }
+
+        // Disable YouTube's scrolling status-bar color tint feature flag (45830993).
+        YtStatusBarScrollColorFeatureFlagFingerprint.clearMatch()
+        runCatching { YtStatusBarScrollColorFeatureFlagFingerprint.matchAll() }
+            .getOrNull()
+            ?.forEach { match ->
+                match.method.insertLiteralOverride(
+                    match.instructionMatches.first().index,
+                    "$EXTENSION_CLASS->disableStatusBarScrollColor(Z)Z"
+                )
+            }
+
+        // Keep YouTube's dedicated status-bar overlay view completely transparent whenever shown/recolored.
+        YtFullscreenStatusBarBackgroundShowFingerprint.clearMatch()
+        YtFullscreenStatusBarBackgroundShowFingerprint.matchOrNull()?.let { match ->
+            match.method.apply {
+                val lastIndex = match.instructionMatches.last().index
+                val viewRegister = getInstruction<FiveRegisterInstruction>(lastIndex).registerC
+
+                var insertIndex = lastIndex + 1
+                val instructions = implementation?.instructions?.toList()
+                while (instructions != null && insertIndex < instructions.size) {
+                    val nextOp = instructions[insertIndex].opcode
+                    if (nextOp == Opcode.INVOKE_STATIC || nextOp == Opcode.INVOKE_STATIC_RANGE) {
+                        insertIndex += 1
+                    } else {
+                        break
+                    }
+                }
+
+                addInstruction(
+                    insertIndex,
+                    "invoke-static/range { v$viewRegister .. v$viewRegister }, " +
+                        "$EXTENSION_CLASS->makeStatusBarBackgroundTransparent(Landroid/view/View;)V"
+                )
+            }
         }
     }
 }

@@ -12,7 +12,8 @@ A standalone **Material 3 Expressive** navigation bar and miniplayer redesign ad
 - **`Remove top black bar`** *(YouTube, stable — standalone edge-to-edge patch for portrait video playback on tablets & phones when hiding the status bar)*
 - **`Scroll away home toolbar`** *(YouTube, stable — makes the Home screen top toolbar scroll away like the top of the page instead of staying persistent)*
 - **`Swap profile photo with Library icon`** *(YouTube, stable — replaces the You tab channel profile photo in the navigation bar with a theme-aware Library icon)*
-- **`Glass navigation bar blur`** *(YouTube, stable — adds an adjustable blur strength slider in Morphe Navigation settings for the glass navigation bar)*
+- **`Glass navigation bar blur`** *(YouTube, stable — adds an adjustable blur strength slider and clean-edge toggle in Morphe Navigation settings for the glass navigation bar)*
+- **`Transparent status bar (YouTube)`** *(YouTube, stable — keeps the status bar visible while removing the gray translucent background/scrim behind it during scrolling)*
 - **`Transparent status bar`** *(YouTube Music, pre-release / `dev` channel only — enable **Use pre-releases** in Morphe Manager to test)*
 
 ---
@@ -38,7 +39,7 @@ A standalone **Material 3 Expressive** navigation bar and miniplayer redesign ad
 2. Confirm adding the patch source when prompted (or add it manually in **Morphe Manager → Patch Sources → Add Source** by pasting `https://github.com/iAmGodKiller/M3-Redesign`).
 3. Keep the official **Morphe** patches source enabled alongside **M3-Redesign**.
 4. **For YouTube Music:** Select **M3 Redesign addon** with your usual YouTube Music patches, patch YouTube Music, then open **Settings → Morphe → M3 Redesign addon** and enable it.
-5. **For YouTube:** Select any combination of **Remove top black bar**, **Scroll away home toolbar**, **Swap profile photo with Library icon**, and **Glass navigation bar blur** alongside your usual YouTube patches and patch YouTube.
+5. **For YouTube:** Select any combination of **Remove top black bar**, **Scroll away home toolbar**, **Swap profile photo with Library icon**, **Glass navigation bar blur**, and **Transparent status bar (YouTube)** alongside your usual YouTube patches and patch YouTube.
 
 ### Method 2 — Manual `.mpp` File
 1. Download the latest `M3-Redesign-v*.mpp` from the **[Releases](https://github.com/iAmGodKiller/M3-Redesign/releases)** page.

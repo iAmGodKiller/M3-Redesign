@@ -33,6 +33,7 @@ import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.widget.EditText;
 import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toolbar;
@@ -80,7 +81,10 @@ public final class YouTubeFullscreenFilter {
             "status_bar_view",
             "status_bar_placeholder",
             "status_bar_spacer",
-            "status_bar_tint"
+            "status_bar_tint",
+            "status_bar_overlay",
+            "toolbar_status_bar_background",
+            "header_status_bar_background"
     };
 
     private static final String[] APP_BAR_NAMES = {
@@ -127,8 +131,11 @@ public final class YouTubeFullscreenFilter {
     private static volatile boolean homeScrollToolbarEnabled = false;
     private static volatile boolean swapProfileWithLibraryEnabled = false;
     private static volatile boolean glassBlurEnabled = false;
+    private static volatile boolean transparentStatusBarEnabled = false;
     private static volatile boolean lifecycleRegistered = false;
     private static volatile WeakReference<Activity> currentActivityRef = new WeakReference<>(null);
+    private static final HashMap<Class<?>, StatusBarScrimMethods> STATUS_BAR_SCRIM_CACHE = new HashMap<>();
+    private static final StatusBarScrimMethods NO_SCRIM_METHODS = new StatusBarScrimMethods(null, null, null, null);
 
     // Glass navigation bar blur + clean edge state (fast O(1) volatile check during draw).
     private static volatile int savedGlassBlurDp = -1; // -1 = App default, 0 = Off, 1..60 = custom dp
@@ -258,6 +265,44 @@ public final class YouTubeFullscreenFilter {
         initActivityHook(activity);
         if (activity != null) {
             ensureGlassBlurPrefLoaded(activity);
+        }
+    }
+
+    /**
+     * Hooked at index 0 of YouTube's MainActivity.onCreate(Bundle) by "Transparent status bar (YouTube)".
+     * Keeps the status bar visible while stripping all gray/translucent scrims behind it.
+     */
+    public static void onTransparentStatusBarEnabled(Activity activity) {
+        transparentStatusBarEnabled = true;
+        initActivityHook(activity);
+    }
+
+    /**
+     * Overrides YouTube's scrolling status-bar color feature flag (45830993) so YouTube does not
+     * paint a semi-transparent gray/dark tint behind the status bar while scrolling.
+     */
+    public static boolean disableStatusBarScrollColor(boolean original) {
+        return transparentStatusBarEnabled ? false : original;
+    }
+
+    /**
+     * Hooked right after YouTube shows/colors its dedicated status bar background view.
+     * Clears the view's background and collapses its visual scale so even scroll alpha animations
+     * cannot paint a gray band behind the status bar icons.
+     */
+    public static void makeStatusBarBackgroundTransparent(View view) {
+        if (!transparentStatusBarEnabled) {
+            return;
+        }
+        try {
+            if (view != null) {
+                silenceStatusBarScrimView(view);
+            }
+            Activity act = currentActivityRef.get();
+            if (act != null && !act.isFinishing() && !act.isDestroyed()) {
+                configureTransparentStatusBarWindow(act);
+            }
+        } catch (Throwable ignored) {
         }
     }
 
@@ -1406,6 +1451,9 @@ public final class YouTubeFullscreenFilter {
                     configureWindow(act);
                     cleanRootTopInsets(act, state);
                 }
+                if (transparentStatusBarEnabled) {
+                    applyTransparentStatusBar(act, decor, state);
+                }
                 if (homeScrollToolbarEnabled) {
                     attachAndSyncAppBar(act, state);
                 }
@@ -1445,6 +1493,10 @@ public final class YouTubeFullscreenFilter {
             configureWindow(activity);
             installInsetStrippers(activity, state);
             cleanRootTopInsets(activity, state);
+        }
+
+        if (transparentStatusBarEnabled && decor != null) {
+            applyTransparentStatusBar(activity, decor, state);
         }
 
         if (swapProfileWithLibraryEnabled && decor != null) {
@@ -2313,6 +2365,228 @@ public final class YouTubeFullscreenFilter {
         int minBand = dpToPx(res, 56);
         int sbBand = sb + dpToPx(res, 16);
         return Math.max(minBand, sbBand);
+    }
+
+    // -------------------------------------------------------------------------
+    // Transparent status bar (YouTube) helpers — keeps status bar visible, strips gray scrims
+    // -------------------------------------------------------------------------
+
+    @SuppressWarnings("deprecation")
+    private static void configureTransparentStatusBarWindow(Activity activity) {
+        if (activity == null) {
+            return;
+        }
+        Window window = activity.getWindow();
+        if (window == null) {
+            return;
+        }
+        try {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_TRANSLUCENT_STATUS);
+            window.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS);
+            window.setStatusBarColor(Color.TRANSPARENT);
+            if (Build.VERSION.SDK_INT >= 29) {
+                window.setStatusBarContrastEnforced(false);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void applyTransparentStatusBar(Activity activity, View decor, ActivityState state) {
+        if (!transparentStatusBarEnabled || activity == null || decor == null) {
+            return;
+        }
+        configureTransparentStatusBarWindow(activity);
+
+        try {
+            View sysStatusBg = decor.findViewById(android.R.id.statusBarBackground);
+            if (sysStatusBg != null) {
+                silenceStatusBarScrimView(sysStatusBg);
+            }
+        } catch (Throwable ignored) {
+        }
+
+        try {
+            for (int i = 0; i < statusBarSpacerIds.length; i++) {
+                View v = decor.findViewById(statusBarSpacerIds[i]);
+                if (v != null) {
+                    silenceStatusBarScrimView(v);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+
+        try {
+            int screenW = decor.getWidth();
+            if (screenW <= 0 && activity.getResources() != null) {
+                screenW = activity.getResources().getDisplayMetrics().widthPixels;
+            }
+            int sbHeight = resolveLiveStatusBarHeightPx(activity, decor);
+            if (screenW > 0 && sbHeight > 0) {
+                clearStatusBarScrimsInTree(decor, screenW, sbHeight, 0, new int[2]);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static int resolveLiveStatusBarHeightPx(Activity activity, View decor) {
+        if (decor != null && Build.VERSION.SDK_INT >= 30) {
+            try {
+                WindowInsets insets = decor.getRootWindowInsets();
+                if (insets != null) {
+                    int top = insets.getInsetsIgnoringVisibility(WindowInsets.Type.statusBars()).top;
+                    if (top > 0) {
+                        return top;
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        int cached = cachedStatusBarHeightPx;
+        if (cached > 0) {
+            return cached;
+        }
+        return readStatusBarHeightPx(activity != null ? activity.getResources() : null);
+    }
+
+    private static void silenceStatusBarScrimView(View view) {
+        if (view == null) {
+            return;
+        }
+        try {
+            if (view.getBackground() != null) {
+                view.setBackgroundColor(Color.TRANSPARENT);
+                view.setBackground(null);
+            }
+            if (view.getAlpha() != 0f) {
+                view.setAlpha(0f);
+            }
+            if (view.getScaleY() != 0f) {
+                view.setScaleY(0f);
+            }
+            if (view.getVisibility() != View.INVISIBLE) {
+                view.setVisibility(View.INVISIBLE);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void clearStatusBarScrimsInTree(
+            View view,
+            int screenWidth,
+            int statusBarHeight,
+            int depth,
+            int[] loc
+    ) {
+        if (view == null || depth > 8) {
+            return;
+        }
+        if (view instanceof ViewGroup) {
+            // Clear CoordinatorLayout / CollapsingToolbarLayout status bar scrims if present.
+            StatusBarScrimMethods methods = getCachedStatusBarScrimMethods(view.getClass());
+            if (methods != null) {
+                try {
+                    if (methods.setStatusBarScrim != null) {
+                        methods.setStatusBarScrim.invoke(view, new Object[]{null});
+                    }
+                    if (methods.setStatusBarScrimColor != null) {
+                        methods.setStatusBarScrimColor.invoke(view, Color.TRANSPARENT);
+                    }
+                    if (methods.setStatusBarBackground != null) {
+                        methods.setStatusBarBackground.invoke(view, new Object[]{null});
+                    }
+                    if (methods.setStatusBarBackgroundColor != null) {
+                        methods.setStatusBarBackgroundColor.invoke(view, Color.TRANSPARENT);
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+
+            ViewGroup vg = (ViewGroup) view;
+            int count = vg.getChildCount();
+            for (int i = 0; i < count; i++) {
+                clearStatusBarScrimsInTree(vg.getChildAt(i), screenWidth, statusBarHeight, depth + 1, loc);
+            }
+            return;
+        }
+
+        // Leaf View check: silence unnamed full-width status-bar-height background scrims pinned at y == 0.
+        if (view instanceof TextView || view instanceof ImageView) {
+            return;
+        }
+        if (view.getVisibility() != View.VISIBLE || view.getAlpha() <= 0f || view.getBackground() == null) {
+            return;
+        }
+        if (view.isClickable() || view.isFocusable()) {
+            return;
+        }
+        int w = view.getWidth();
+        int h = view.getHeight();
+        if (w < (int) (screenWidth * 0.90f)) {
+            return;
+        }
+        if (h < Math.max(8, statusBarHeight - 8) || h > statusBarHeight + 12) {
+            return;
+        }
+        view.getLocationInWindow(loc);
+        if (loc[1] >= -4 && loc[1] <= 4) {
+            silenceStatusBarScrimView(view);
+        }
+    }
+
+    private static StatusBarScrimMethods getCachedStatusBarScrimMethods(Class<?> cls) {
+        synchronized (STATUS_BAR_SCRIM_CACHE) {
+            StatusBarScrimMethods cached = STATUS_BAR_SCRIM_CACHE.get(cls);
+            if (cached != null) {
+                return cached == NO_SCRIM_METHODS ? null : cached;
+            }
+        }
+        Method setScrim = null;
+        Method setScrimColor = null;
+        Method setBg = null;
+        Method setBgColor = null;
+        try {
+            setScrim = findPublicMethod(cls, "setStatusBarScrim", Drawable.class);
+            setScrimColor = findPublicMethod(cls, "setStatusBarScrimColor", int.class);
+            setBg = findPublicMethod(cls, "setStatusBarBackground", Drawable.class);
+            setBgColor = findPublicMethod(cls, "setStatusBarBackgroundColor", int.class);
+        } catch (Throwable ignored) {
+        }
+        StatusBarScrimMethods resolved = (setScrim != null || setScrimColor != null || setBg != null || setBgColor != null)
+                ? new StatusBarScrimMethods(setScrim, setScrimColor, setBg, setBgColor)
+                : NO_SCRIM_METHODS;
+        synchronized (STATUS_BAR_SCRIM_CACHE) {
+            STATUS_BAR_SCRIM_CACHE.put(cls, resolved);
+        }
+        return resolved == NO_SCRIM_METHODS ? null : resolved;
+    }
+
+    private static Method findPublicMethod(Class<?> cls, String name, Class<?> paramType) {
+        try {
+            Method m = cls.getMethod(name, paramType);
+            m.setAccessible(true);
+            return m;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static final class StatusBarScrimMethods {
+        final Method setStatusBarScrim;
+        final Method setStatusBarScrimColor;
+        final Method setStatusBarBackground;
+        final Method setStatusBarBackgroundColor;
+
+        StatusBarScrimMethods(
+                Method setStatusBarScrim,
+                Method setStatusBarScrimColor,
+                Method setStatusBarBackground,
+                Method setStatusBarBackgroundColor
+        ) {
+            this.setStatusBarScrim = setStatusBarScrim;
+            this.setStatusBarScrimColor = setStatusBarScrimColor;
+            this.setStatusBarBackground = setStatusBarBackground;
+            this.setStatusBarBackgroundColor = setStatusBarBackgroundColor;
+        }
     }
 
     private static int dpToPx(Resources res, int dp) {
