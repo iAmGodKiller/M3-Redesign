@@ -1,6 +1,6 @@
 {
   "NOTE": "Do NOT manually edit this file. This file is automatically updated when semantic release (release.yml) runs. Manually editing this file can break your releases and break third party tools that use this file.",
-  "version": "3.2.0",
+  "version": "3.2.1",
   "patches": [
     {
       "name": "M3 Redesign addon",
@@ -35,6 +35,36 @@
     {
       "name": "Remove top black bar",
       "description": "Removes the black status-bar gap above YouTube videos in portrait full screen (especially on tablets) when hiding the status bar, allowing true edge-to-edge playback.",
+      "default": false,
+      "category": null,
+      "compatiblePackages": [
+        {
+          "packageName": "com.google.android.youtube",
+          "name": "YouTube",
+          "description": null,
+          "apkFileType": "APK_REQUIRED",
+          "appIconColor": "#FF0033",
+          "signatures": [
+            "5aad2bee6db95d17e05a08d7d1e64c10a1511879154483916b6ae6c7fd9cb0c6",
+            "3d7a1223019aa39d9ea0e3436ab7c0896bfb4fb679f4de5fe7c23f326c8f994a"
+          ],
+          "formFactor": "MOBILE",
+          "targets": [
+            {
+              "version": null,
+              "versionCodes": null,
+              "isExperimental": false,
+              "minSdk": 26,
+              "description": null
+            }
+          ]
+        }
+      ],
+      "options": []
+    },
+    {
+      "name": "Scroll away home toolbar",
+      "description": "Makes the YouTube Home screen top toolbar act like the top of the page so it scrolls away cleanly with the feed instead of staying persistent or popping back mid-page.",
       "default": false,
       "category": null,
       "compatiblePackages": [
