@@ -198,3 +198,24 @@ val removeTopBlackBarPatch = patch(
         }
     }
 }
+
+@Suppress("unused")
+val scrollAwayHomeToolbarPatch = patch(
+    name = "Scroll away home toolbar",
+    description = "Makes the YouTube Home screen top toolbar act like the top of the page so it scrolls away cleanly with the feed instead of staying persistent or popping back mid-page.",
+    default = false
+) {
+    compatibleWith(COMPATIBILITY_YOUTUBE_ANY)
+    extendWith("extensions/ytfullscreen.mpe")
+
+    finalize {
+        YtFullscreenMainActivityOnCreateFingerprint.let {
+            it.clearMatch()
+            it.method.addInstruction(
+                0,
+                "invoke-static/range { p0 .. p0 }, " +
+                    "$EXTENSION_CLASS->onHomeScrollToolbarEnabled(Landroid/app/Activity;)V"
+            )
+        }
+    }
+}
