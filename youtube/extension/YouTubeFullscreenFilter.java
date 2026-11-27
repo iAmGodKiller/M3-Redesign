@@ -152,9 +152,11 @@ public final class YouTubeFullscreenFilter {
     private static final GlassCapsuleFields NO_GLASS_FIELDS = new GlassCapsuleFields(null, null, null, null, null, null);
     private static final HashMap<Class<?>, Field> CALLBACK_OUTER_FIELD_CACHE = new HashMap<>();
 
-    // Navigation button enum tracking so ONLY the "You" (profile photo) tab is swapped.
+    // Navigation button enum tracking so ONLY the "You" tab is swapped and Home tab is accurately tracked.
     private static volatile String lastNavigationEnumName = null;
     private static final WeakHashMap<View, Boolean> YOU_TAB_VIEWS = new WeakHashMap<>();
+    private static final WeakHashMap<View, Boolean> HOME_TAB_VIEWS = new WeakHashMap<>();
+    private static volatile Boolean lastSelectedTabIsHome = null;
 
     // Process-wide cached resource IDs (resolved once, never during scroll).
     private static volatile boolean idsResolved = false;
@@ -222,7 +224,9 @@ public final class YouTubeFullscreenFilter {
         ViewTreeObserver.OnWindowFocusChangeListener focusChangeListener;
         View.OnLayoutChangeListener appBarLayoutChangeListener;
         Runnable debouncedAppBarRunnable;
+        Runnable secondaryAppBarRunnable;
         Runnable coldStartRetryRunnable;
+        Runnable[] tabSyncRunnables;
     }
 
     private YouTubeFullscreenFilter() {
@@ -771,16 +775,15 @@ public final class YouTubeFullscreenFilter {
     }
 
     // -------------------------------------------------------------------------
-    // Swap profile photo with Library icon hooks
+    // PivotBar tab tracking (Swap profile photo with Library icon + Home toolbar)
     // -------------------------------------------------------------------------
 
     /**
      * Hooked right after YouTube resolves the navigation button enum inside InitializeButtons.
-     * Every non-"You" tab (Home, Shorts, Create, Subscriptions, Notifications, etc.) sets an enum
-     * right before creating its PivotBar tab view; the modern "You" profile photo tab does not.
+     * Tracks both the modern "You" profile photo tab and the "Home" tab (even if tabs are reordered).
      */
     public static void onNavigationEnumLoaded(Enum<?> ytNavigationEnum) {
-        if (!swapProfileWithLibraryEnabled) {
+        if (!swapProfileWithLibraryEnabled && !homeScrollToolbarEnabled) {
             return;
         }
         try {
@@ -797,14 +800,17 @@ public final class YouTubeFullscreenFilter {
      * arrives with lastNavigationEnumName == null (or a You/Account/Library enum).
      */
     public static void onImageResourceTabLoaded(final View tabView) {
-        if (!swapProfileWithLibraryEnabled || tabView == null) {
+        if ((!swapProfileWithLibraryEnabled && !homeScrollToolbarEnabled) || tabView == null) {
             lastNavigationEnumName = null;
             return;
         }
         try {
             String enumName = lastNavigationEnumName;
             lastNavigationEnumName = null;
-            if (enumName == null || isYouProfileTabEnum(enumName)) {
+            if (homeScrollToolbarEnabled && isHomeTabEnum(enumName)) {
+                HOME_TAB_VIEWS.put(tabView, Boolean.TRUE);
+            }
+            if (swapProfileWithLibraryEnabled && (enumName == null || isYouProfileTabEnum(enumName))) {
                 registerAndSwapYouTab(tabView);
             }
         } catch (Throwable ignored) {
@@ -813,22 +819,36 @@ public final class YouTubeFullscreenFilter {
 
     /**
      * Hooked right after PivotBar creates a drawable or int-resource tab view inside InitializeButtons.
-     * Consumes lastNavigationEnumName so it never leaks into the following tab, and swaps only if
-     * the enum explicitly identifies the You/Account/Library tab.
+     * Consumes lastNavigationEnumName so it never leaks into the following tab, registers the Home tab
+     * for scroll-away tracking, and swaps only if the enum identifies the You/Account/Library tab.
      */
     public static void onNavigationTabLoaded(final View tabView) {
-        if (!swapProfileWithLibraryEnabled || tabView == null) {
+        if ((!swapProfileWithLibraryEnabled && !homeScrollToolbarEnabled) || tabView == null) {
             lastNavigationEnumName = null;
             return;
         }
         try {
             String enumName = lastNavigationEnumName;
             lastNavigationEnumName = null;
-            if (isYouProfileTabEnum(enumName)) {
+            if (homeScrollToolbarEnabled && isHomeTabEnum(enumName)) {
+                HOME_TAB_VIEWS.put(tabView, Boolean.TRUE);
+            }
+            if (swapProfileWithLibraryEnabled && isYouProfileTabEnum(enumName)) {
                 registerAndSwapYouTab(tabView);
             }
         } catch (Throwable ignored) {
         }
+    }
+
+    private static boolean isHomeTabEnum(String enumName) {
+        if (enumName == null) {
+            return false;
+        }
+        return "PIVOT_HOME".equals(enumName)
+                || "TAB_HOME_CAIRO".equals(enumName)
+                || "HOME".equals(enumName)
+                || enumName.contains("_HOME")
+                || enumName.startsWith("HOME_");
     }
 
     private static boolean isYouProfileTabEnum(String enumName) {
@@ -862,26 +882,81 @@ public final class YouTubeFullscreenFilter {
 
     /**
      * Hooked right after setSelected(boolean) inside PivotBar.
-     * Strictly gated to verified You tab views so other tabs are never touched.
+     * Updates the Library icon selection state on the You tab, and re-syncs AppBarLayout scroll flags
+     * whenever the user switches tabs (including returning to Home via tab tap or Back navigation).
      */
     public static void onPivotTabSelected(View tabView, boolean isSelected) {
-        if (!swapProfileWithLibraryEnabled || tabView == null) {
+        if ((!swapProfileWithLibraryEnabled && !homeScrollToolbarEnabled) || tabView == null) {
             return;
         }
-        if (!Boolean.TRUE.equals(YOU_TAB_VIEWS.get(tabView))) {
+        if (swapProfileWithLibraryEnabled && Boolean.TRUE.equals(YOU_TAB_VIEWS.get(tabView))) {
+            try {
+                ViewGroup avatarContainer = findYouTabAvatarContainer(tabView);
+                if (avatarContainer != null) {
+                    swapYouTabToLibraryIcon(tabView);
+                    View icon = avatarContainer.findViewWithTag(LIBRARY_ICON_TAG);
+                    if (icon instanceof LibraryIconView) {
+                        ((LibraryIconView) icon).setTabSelected(isSelected);
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        if (homeScrollToolbarEnabled && isSelected) {
+            try {
+                if (!HOME_TAB_VIEWS.isEmpty()) {
+                    lastSelectedTabIsHome = Boolean.TRUE.equals(HOME_TAB_VIEWS.get(tabView));
+                } else {
+                    lastSelectedTabIsHome = null;
+                }
+                scheduleHomeToolbarTabSync();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private static void scheduleHomeToolbarTabSync() {
+        Activity act = currentActivityRef.get();
+        if (act == null || act.isFinishing() || act.isDestroyed()) {
             return;
         }
-        try {
-            ViewGroup avatarContainer = findYouTabAvatarContainer(tabView);
-            if (avatarContainer == null) {
-                return;
+        final ActivityState state = getState(act);
+        cancelPendingTabSyncs(state);
+
+        final WeakReference<Activity> actRef = new WeakReference<>(act);
+        final long[] delaysMs = {0L, 140L, 380L, 700L};
+        Runnable[] tasks = new Runnable[delaysMs.length];
+        for (int i = 0; i < delaysMs.length; i++) {
+            Runnable r = new Runnable() {
+                @Override
+                public void run() {
+                    Activity a = actRef.get();
+                    if (a == null || a.isFinishing() || a.isDestroyed()) {
+                        return;
+                    }
+                    attachAndSyncAppBar(a, state);
+                }
+            };
+            tasks[i] = r;
+            if (delaysMs[i] == 0L) {
+                MAIN_HANDLER.post(r);
+            } else {
+                MAIN_HANDLER.postDelayed(r, delaysMs[i]);
             }
-            swapYouTabToLibraryIcon(tabView);
-            View icon = avatarContainer.findViewWithTag(LIBRARY_ICON_TAG);
-            if (icon instanceof LibraryIconView) {
-                ((LibraryIconView) icon).setTabSelected(isSelected);
+        }
+        state.tabSyncRunnables = tasks;
+    }
+
+    private static void cancelPendingTabSyncs(ActivityState state) {
+        if (state == null || state.tabSyncRunnables == null) {
+            return;
+        }
+        Runnable[] tasks = state.tabSyncRunnables;
+        state.tabSyncRunnables = null;
+        for (int i = 0; i < tasks.length; i++) {
+            if (tasks[i] != null) {
+                MAIN_HANDLER.removeCallbacks(tasks[i]);
             }
-        } catch (Throwable ignored) {
         }
     }
 
@@ -1350,16 +1425,10 @@ public final class YouTubeFullscreenFilter {
         if (state == null) {
             return;
         }
+        cancelPendingTabSyncs(state);
         try {
             ViewGroup appBar = state.cachedAppBarRef.get();
-            if (appBar != null) {
-                if (state.appBarLayoutChangeListener != null) {
-                    appBar.removeOnLayoutChangeListener(state.appBarLayoutChangeListener);
-                }
-                if (state.debouncedAppBarRunnable != null) {
-                    appBar.removeCallbacks(state.debouncedAppBarRunnable);
-                }
-            }
+            detachAppBarListeners(appBar, state);
         } catch (Throwable ignored) {
         }
         try {
@@ -1869,6 +1938,27 @@ public final class YouTubeFullscreenFilter {
     // Home screen scrolling toolbar ("Scroll away home toolbar" patch)
     // -------------------------------------------------------------------------
 
+    private static void detachAppBarListeners(ViewGroup appBar, ActivityState state) {
+        if (state == null) {
+            return;
+        }
+        if (appBar != null) {
+            try {
+                if (state.appBarLayoutChangeListener != null) {
+                    appBar.removeOnLayoutChangeListener(state.appBarLayoutChangeListener);
+                }
+                if (state.debouncedAppBarRunnable != null) {
+                    appBar.removeCallbacks(state.debouncedAppBarRunnable);
+                }
+                if (state.secondaryAppBarRunnable != null) {
+                    appBar.removeCallbacks(state.secondaryAppBarRunnable);
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        state.appBarListenerAttached = false;
+    }
+
     private static boolean attachAndSyncAppBar(Activity activity, final ActivityState state) {
         Window window = activity.getWindow();
         if (window == null) {
@@ -1881,7 +1971,7 @@ public final class YouTubeFullscreenFilter {
             return false;
         }
 
-        ViewGroup appBar = findAppBarLayoutFast(searchRoot, state);
+        final ViewGroup appBar = findAppBarLayoutFast(searchRoot, state);
         if (appBar == null) {
             return false;
         }
@@ -1890,7 +1980,7 @@ public final class YouTubeFullscreenFilter {
             final WeakReference<Activity> actRef = new WeakReference<>(activity);
             final WeakReference<ViewGroup> barRef = new WeakReference<>(appBar);
 
-            state.debouncedAppBarRunnable = new Runnable() {
+            Runnable syncTask = new Runnable() {
                 @Override
                 public void run() {
                     Activity act = actRef.get();
@@ -1898,7 +1988,22 @@ public final class YouTubeFullscreenFilter {
                     if (act == null || bar == null || act.isFinishing() || act.isDestroyed()) {
                         return;
                     }
-                    if (bar.getTop() < 0) {
+                    if (!bar.isAttachedToWindow() || !bar.isShown() || bar.getTop() < 0) {
+                        return;
+                    }
+                    updateAppBarScrollFlags(act, bar, state);
+                }
+            };
+            state.debouncedAppBarRunnable = syncTask;
+            state.secondaryAppBarRunnable = new Runnable() {
+                @Override
+                public void run() {
+                    Activity act = actRef.get();
+                    ViewGroup bar = barRef.get();
+                    if (act == null || bar == null || act.isFinishing() || act.isDestroyed()) {
+                        return;
+                    }
+                    if (!bar.isAttachedToWindow() || !bar.isShown() || bar.getTop() < 0) {
                         return;
                     }
                     updateAppBarScrollFlags(act, bar, state);
@@ -1919,6 +2024,10 @@ public final class YouTubeFullscreenFilter {
                         v.removeCallbacks(state.debouncedAppBarRunnable);
                         v.postDelayed(state.debouncedAppBarRunnable, APPBAR_UPDATE_DEBOUNCE_MS);
                     }
+                    if (state.secondaryAppBarRunnable != null) {
+                        v.removeCallbacks(state.secondaryAppBarRunnable);
+                        v.postDelayed(state.secondaryAppBarRunnable, 260L);
+                    }
                 }
             };
             appBar.addOnLayoutChangeListener(state.appBarLayoutChangeListener);
@@ -1938,6 +2047,7 @@ public final class YouTubeFullscreenFilter {
         Window window = activity.getWindow();
         View decor = window != null ? window.getDecorView() : null;
         boolean shouldScrollAway = isHomeToolbarScreen(decor, appBar, state);
+        boolean modified = false;
 
         int count = appBar.getChildCount();
         for (int i = 0; i < count; i++) {
@@ -1962,16 +2072,21 @@ public final class YouTubeFullscreenFilter {
                     if (current != SCROLL_FLAG_SCROLL) {
                         accessor.set(lp, SCROLL_FLAG_SCROLL);
                         child.setLayoutParams(lp);
+                        modified = true;
                     }
                 } else {
                     Integer orig = state.originalScrollFlags.get(child);
                     if (orig != null && current != orig) {
                         accessor.set(lp, orig);
                         child.setLayoutParams(lp);
+                        modified = true;
                     }
                 }
             } catch (Throwable ignored) {
             }
+        }
+        if (modified) {
+            appBar.requestLayout();
         }
     }
 
@@ -1982,6 +2097,10 @@ public final class YouTubeFullscreenFilter {
         if (hasNonHomeToolbarTitle(appBar, 0)) {
             return false;
         }
+        Boolean trackedHome = getTrackedHomeTabSelection();
+        if (trackedHome != null) {
+            return trackedHome;
+        }
         if (decor == null) {
             return true;
         }
@@ -1991,6 +2110,26 @@ public final class YouTubeFullscreenFilter {
         }
         int selectedIndex = findSelectedNavTabIndex(navBar);
         return selectedIndex <= 0;
+    }
+
+    private static Boolean getTrackedHomeTabSelection() {
+        boolean foundAttachedHomeTab = false;
+        try {
+            for (View homeTab : HOME_TAB_VIEWS.keySet()) {
+                if (homeTab != null && homeTab.isAttachedToWindow()) {
+                    foundAttachedHomeTab = true;
+                    if (homeTab.isSelected() || homeTab.isActivated()) {
+                        return Boolean.TRUE;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        Boolean last = lastSelectedTabIsHome;
+        if (last != null) {
+            return last;
+        }
+        return foundAttachedHomeTab ? Boolean.FALSE : null;
     }
 
     private static boolean containsVisibleEditText(View node, int depth) {
@@ -2019,7 +2158,10 @@ public final class YouTubeFullscreenFilter {
         CharSequence title = extractToolbarTitle(node);
         if (title != null && title.length() > 0) {
             String s = title.toString().trim();
-            if (!s.isEmpty() && !s.equalsIgnoreCase("YouTube") && !s.equalsIgnoreCase("Home")) {
+            if (!s.isEmpty()
+                    && !s.equalsIgnoreCase("YouTube")
+                    && !s.equalsIgnoreCase("Home")
+                    && hasVisibleTitleText(node, s, 0)) {
                 return true;
             }
         }
@@ -2028,6 +2170,33 @@ public final class YouTubeFullscreenFilter {
             int count = vg.getChildCount();
             for (int i = 0; i < count; i++) {
                 if (hasNonHomeToolbarTitle(vg.getChildAt(i), depth + 1)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Confirms the Toolbar title is actually rendered in a visible TextView child rather than a stale
+     * mTitle left over from a previously visited tab after returning to the Home logo toolbar.
+     */
+    private static boolean hasVisibleTitleText(View node, String expectedTitle, int depth) {
+        if (node == null || depth > 4 || !node.isShown() || node.getAlpha() <= 0.05f) {
+            return false;
+        }
+        if (node instanceof TextView) {
+            CharSequence txt = ((TextView) node).getText();
+            if (txt != null && expectedTitle.equals(txt.toString().trim())
+                    && node.getWidth() > 0 && node.getHeight() > 0) {
+                return true;
+            }
+        }
+        if (node instanceof ViewGroup) {
+            ViewGroup vg = (ViewGroup) node;
+            int count = vg.getChildCount();
+            for (int i = 0; i < count; i++) {
+                if (hasVisibleTitleText(vg.getChildAt(i), expectedTitle, depth + 1)) {
                     return true;
                 }
             }
@@ -2078,34 +2247,50 @@ public final class YouTubeFullscreenFilter {
 
     private static ViewGroup findAppBarLayoutFast(View root, ActivityState state) {
         ViewGroup cached = state.cachedAppBarRef.get();
-        if (cached != null && cached.isAttachedToWindow()) {
+        if (cached != null && cached.isAttachedToWindow() && cached.isShown()) {
             return cached;
         }
-        state.appBarListenerAttached = false;
+        if (cached != null) {
+            detachAppBarListeners(cached, state);
+        } else {
+            state.appBarListenerAttached = false;
+        }
 
+        ViewGroup fallback = null;
         for (int i = 0; i < appBarIds.length; i++) {
             View v = root.findViewById(appBarIds[i]);
             if (v instanceof ViewGroup && isAppBarLayoutClass(v)) {
                 ViewGroup bar = (ViewGroup) v;
-                state.cachedAppBarRef = new WeakReference<>(bar);
-                return bar;
+                if (bar.isShown()) {
+                    state.cachedAppBarRef = new WeakReference<>(bar);
+                    return bar;
+                }
+                if (fallback == null) {
+                    fallback = bar;
+                }
             }
         }
 
-        ViewGroup found = findAppBarLayoutRecursive(root, 0);
+        ViewGroup found = findAppBarLayoutRecursive(root, 0, true);
+        if (found == null) {
+            found = fallback != null ? fallback : findAppBarLayoutRecursive(root, 0, false);
+        }
         if (found != null) {
             state.cachedAppBarRef = new WeakReference<>(found);
         }
         return found;
     }
 
-    private static ViewGroup findAppBarLayoutRecursive(View node, int depth) {
+    private static ViewGroup findAppBarLayoutRecursive(View node, int depth, boolean requireShown) {
         if (node == null || depth > 8) {
             return null;
         }
         if (node instanceof ViewGroup) {
             if (isAppBarLayoutClass(node)) {
-                return (ViewGroup) node;
+                if (!requireShown || node.isShown()) {
+                    return (ViewGroup) node;
+                }
+                return null;
             }
             if (isScrollableFeedContainer(node)) {
                 return null;
@@ -2113,7 +2298,7 @@ public final class YouTubeFullscreenFilter {
             ViewGroup vg = (ViewGroup) node;
             int count = vg.getChildCount();
             for (int i = 0; i < count; i++) {
-                ViewGroup found = findAppBarLayoutRecursive(vg.getChildAt(i), depth + 1);
+                ViewGroup found = findAppBarLayoutRecursive(vg.getChildAt(i), depth + 1, requireShown);
                 if (found != null) {
                     return found;
                 }

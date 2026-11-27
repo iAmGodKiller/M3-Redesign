@@ -306,6 +306,9 @@ val scrollAwayHomeToolbarPatch = patch(
                     "$EXTENSION_CLASS->onHomeScrollToolbarEnabled(Landroid/app/Activity;)V"
             )
         }
+
+        hookPivotBarEnumTrackingIfNeeded()
+        hookPivotBarTabSelectedIfNeeded()
     }
 }
 
@@ -328,77 +331,8 @@ val swapProfileWithLibraryPatch = patch(
             )
         }
 
-        // Track YouTube's navigation button enum inside InitializeButtons so ONLY the
-        // "You" (profile photo / library) tab is swapped, leaving Home/Shorts/Subscriptions/Create untouched.
-        YtNavigationEnumFingerprint.clearMatch()
-        val navigationEnumClassName = YtNavigationEnumFingerprint.matchOrNull()?.originalClassDef?.type
-
-        YtPivotBarConstructorFingerprint.clearMatch()
-        YtInitializeButtonsFingerprint.clearMatch()
-        if (navigationEnumClassName != null) {
-            YtInitializeButtonsFingerprint.matchOrNull()?.method?.apply {
-                val instrs = implementation?.instructions?.toList() ?: return@apply
-                for (i in instrs.indices.reversed()) {
-                    if (i + 1 >= instrs.size || instrs[i + 1].opcode != Opcode.MOVE_RESULT_OBJECT) {
-                        continue
-                    }
-                    val insn = instrs[i]
-                    val ref = (insn as? ReferenceInstruction)?.getReference<MethodReference>() ?: continue
-                    val resultReg = (instrs[i + 1] as OneRegisterInstruction).registerA
-
-                    if ((insn.opcode == Opcode.INVOKE_STATIC || insn.opcode == Opcode.INVOKE_STATIC_RANGE)
-                        && ref.definingClass == navigationEnumClassName
-                        && ref.returnType == navigationEnumClassName
-                    ) {
-                        addInstruction(
-                            i + 2,
-                            "invoke-static/range { v$resultReg .. v$resultReg }, " +
-                                "$EXTENSION_CLASS->onNavigationEnumLoaded(Ljava/lang/Enum;)V"
-                        )
-                    } else if ((insn.opcode == Opcode.INVOKE_VIRTUAL || insn.opcode == Opcode.INVOKE_VIRTUAL_RANGE)
-                        && ref.definingClass == PIVOT_BAR_CLASS
-                        && ref.returnType == "Landroid/view/View;"
-                    ) {
-                        val params = ref.parameterTypes
-                        val isImageResourceStyledTab = params.size == 4
-                            && params[1].toString() == "Z"
-                            && params[2].toString() == "I"
-                        val isStandardTab = params.firstOrNull()?.toString() == "Landroid/graphics/drawable/Drawable;"
-                            || params.firstOrNull()?.toString() == "I"
-
-                        if (isImageResourceStyledTab) {
-                            addInstruction(
-                                i + 2,
-                                "invoke-static/range { v$resultReg .. v$resultReg }, " +
-                                    "$EXTENSION_CLASS->onImageResourceTabLoaded(Landroid/view/View;)V"
-                            )
-                        } else if (isStandardTab) {
-                            addInstruction(
-                                i + 2,
-                                "invoke-static/range { v$resultReg .. v$resultReg }, " +
-                                    "$EXTENSION_CLASS->onNavigationTabLoaded(Landroid/view/View;)V"
-                            )
-                        }
-                    }
-                }
-            }
-        }
-
-        YtPivotBarSetSelectedFingerprint.clearMatch()
-        YtPivotBarSetSelectedFingerprint.matchOrNull()?.let { match ->
-            match.method.apply {
-                val index = match.instructionMatches.first().index
-                val call = getInstruction<FiveRegisterInstruction>(index)
-                val viewRegister = call.registerC
-                val selectedRegister = call.registerD
-
-                addInstruction(
-                    index + 1,
-                    "invoke-static { v$viewRegister, v$selectedRegister }, " +
-                        "$EXTENSION_CLASS->onPivotTabSelected(Landroid/view/View;Z)V"
-                )
-            }
-        }
+        hookPivotBarEnumTrackingIfNeeded()
+        hookPivotBarTabSelectedIfNeeded()
     }
 }
 
@@ -585,6 +519,95 @@ val transparentStatusBarYouTubePatch = patch(
                         "$EXTENSION_CLASS->makeStatusBarBackgroundTransparent(Landroid/view/View;)V"
                 )
             }
+        }
+    }
+}
+
+private fun hookPivotBarEnumTrackingIfNeeded() {
+    YtNavigationEnumFingerprint.clearMatch()
+    val navigationEnumClassName = YtNavigationEnumFingerprint.matchOrNull()?.originalClassDef?.type ?: return
+
+    YtPivotBarConstructorFingerprint.clearMatch()
+    YtInitializeButtonsFingerprint.clearMatch()
+    YtInitializeButtonsFingerprint.matchOrNull()?.method?.apply {
+        val instrs = implementation?.instructions?.toList() ?: return@apply
+        val alreadyHooked = instrs.any { insn ->
+            val ref = (insn as? ReferenceInstruction)?.getReference<MethodReference>()
+            ref != null && ref.definingClass == EXTENSION_CLASS && ref.name == "onNavigationEnumLoaded"
+        }
+        if (alreadyHooked) {
+            return@apply
+        }
+
+        for (i in instrs.indices.reversed()) {
+            if (i + 1 >= instrs.size || instrs[i + 1].opcode != Opcode.MOVE_RESULT_OBJECT) {
+                continue
+            }
+            val insn = instrs[i]
+            val ref = (insn as? ReferenceInstruction)?.getReference<MethodReference>() ?: continue
+            val resultReg = (instrs[i + 1] as OneRegisterInstruction).registerA
+
+            if ((insn.opcode == Opcode.INVOKE_STATIC || insn.opcode == Opcode.INVOKE_STATIC_RANGE)
+                && ref.definingClass == navigationEnumClassName
+                && ref.returnType == navigationEnumClassName
+            ) {
+                addInstruction(
+                    i + 2,
+                    "invoke-static/range { v$resultReg .. v$resultReg }, " +
+                        "$EXTENSION_CLASS->onNavigationEnumLoaded(Ljava/lang/Enum;)V"
+                )
+            } else if ((insn.opcode == Opcode.INVOKE_VIRTUAL || insn.opcode == Opcode.INVOKE_VIRTUAL_RANGE)
+                && ref.definingClass == PIVOT_BAR_CLASS
+                && ref.returnType == "Landroid/view/View;"
+            ) {
+                val params = ref.parameterTypes
+                val isImageResourceStyledTab = params.size == 4
+                    && params[1].toString() == "Z"
+                    && params[2].toString() == "I"
+                val isStandardTab = params.firstOrNull()?.toString() == "Landroid/graphics/drawable/Drawable;"
+                    || params.firstOrNull()?.toString() == "I"
+
+                if (isImageResourceStyledTab) {
+                    addInstruction(
+                        i + 2,
+                        "invoke-static/range { v$resultReg .. v$resultReg }, " +
+                            "$EXTENSION_CLASS->onImageResourceTabLoaded(Landroid/view/View;)V"
+                    )
+                } else if (isStandardTab) {
+                    addInstruction(
+                        i + 2,
+                        "invoke-static/range { v$resultReg .. v$resultReg }, " +
+                            "$EXTENSION_CLASS->onNavigationTabLoaded(Landroid/view/View;)V"
+                    )
+                }
+            }
+        }
+    }
+}
+
+private fun hookPivotBarTabSelectedIfNeeded() {
+    YtPivotBarSetSelectedFingerprint.clearMatch()
+    YtPivotBarSetSelectedFingerprint.matchOrNull()?.let { match ->
+        match.method.apply {
+            val instrs = implementation?.instructions?.toList() ?: return@apply
+            val alreadyHooked = instrs.any { insn ->
+                val ref = (insn as? ReferenceInstruction)?.getReference<MethodReference>()
+                ref != null && ref.definingClass == EXTENSION_CLASS && ref.name == "onPivotTabSelected"
+            }
+            if (alreadyHooked) {
+                return@apply
+            }
+
+            val index = match.instructionMatches.first().index
+            val call = getInstruction<FiveRegisterInstruction>(index)
+            val viewRegister = call.registerC
+            val selectedRegister = call.registerD
+
+            addInstruction(
+                index + 1,
+                "invoke-static { v$viewRegister, v$selectedRegister }, " +
+                    "$EXTENSION_CLASS->onPivotTabSelected(Landroid/view/View;Z)V"
+            )
         }
     }
 }
