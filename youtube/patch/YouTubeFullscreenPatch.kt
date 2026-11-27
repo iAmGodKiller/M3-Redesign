@@ -5,23 +5,45 @@ import app.morphe.patcher.InstructionLocation.MatchAfterImmediately
 import app.morphe.patcher.extensions.InstructionExtensions.addInstruction
 import app.morphe.patcher.extensions.InstructionExtensions.addInstructions
 import app.morphe.patcher.extensions.InstructionExtensions.getInstruction
+import app.morphe.patcher.extensions.InstructionExtensions.replaceInstruction
 import app.morphe.patcher.fieldAccess
 import app.morphe.patcher.methodCall
 import app.morphe.patcher.patch.ApkFileType
 import app.morphe.patcher.patch.AppTarget
 import app.morphe.patcher.patch.Compatibility
 import app.morphe.patcher.patch.patch
+import app.morphe.patcher.patch.resourceFile
+import app.morphe.patcher.patch.resourceXml
+import app.morphe.patcher.patch.resourceXmlOrNull
+import app.morphe.patcher.string
+import app.morphe.patcher.util.getReference
+import app.morphe.patcher.util.proxy.mutableTypes.MutableMethod
+import app.morphe.patcher.xml.XmlElement
 import app.morphe.patches.youtube.shared.Constants.COMPATIBILITY_YOUTUBE
 import com.android.tools.smali.dexlib2.AccessFlags
 import com.android.tools.smali.dexlib2.Opcode
 import com.android.tools.smali.dexlib2.iface.instruction.FiveRegisterInstruction
+import com.android.tools.smali.dexlib2.iface.instruction.OneRegisterInstruction
+import com.android.tools.smali.dexlib2.iface.instruction.ReferenceInstruction
+import com.android.tools.smali.dexlib2.iface.instruction.RegisterRangeInstruction
 import com.android.tools.smali.dexlib2.iface.instruction.TwoRegisterInstruction
+import com.android.tools.smali.dexlib2.iface.reference.MethodReference
 
 private const val EXTENSION_CLASS =
     "Lapp/morphe/extension/youtube/patches/fullscreen/YouTubeFullscreenFilter;"
 
+private const val ADD_ON_PREFERENCES_FILE_PATH = "morphe_addon_prefs.xml"
+
+private const val GLASS_BLUR_PREFERENCE_TAG =
+    "app.morphe.extension.youtube.patches.fullscreen.YouTubeGlassBlurPreference"
+
+private const val GLASS_BLUR_PREFERENCE_KEY = "morphe_yt_glass_blur_radius"
+
 private const val YOUTUBE_MAIN_ACTIVITY_CLASS =
     "Lcom/google/android/apps/youtube/app/watchwhile/MainActivity;"
+
+private const val PIVOT_BAR_CLASS =
+    "Lcom/google/android/libraries/youtube/rendering/ui/pivotbar/PivotBar;"
 
 private object YtFullscreenMainActivityOnCreateFingerprint : Fingerprint(
     definingClass = YOUTUBE_MAIN_ACTIVITY_CLASS,
@@ -81,6 +103,63 @@ private object YtFullscreenStatusBarBackgroundShowFingerprint : Fingerprint(
     )
 )
 
+private object YtPivotBarCreateResourceStyledViewFingerprint : Fingerprint(
+    definingClass = PIVOT_BAR_CLASS,
+    accessFlags = listOf(AccessFlags.PUBLIC, AccessFlags.FINAL),
+    returnType = "Landroid/view/View;",
+    parameters = listOf("L", "Z", "I", "L")
+)
+
+private object YtPivotBarCreateDrawableViewFingerprint : Fingerprint(
+    definingClass = PIVOT_BAR_CLASS,
+    accessFlags = listOf(AccessFlags.PUBLIC, AccessFlags.FINAL),
+    returnType = "Landroid/view/View;",
+    custom = { method, _ ->
+        method.parameterTypes.firstOrNull()?.toString() == "Landroid/graphics/drawable/Drawable;"
+    }
+)
+
+private object YtPivotBarCreateResourceIntViewFingerprint : Fingerprint(
+    definingClass = PIVOT_BAR_CLASS,
+    accessFlags = listOf(AccessFlags.PUBLIC, AccessFlags.FINAL),
+    returnType = "Landroid/view/View;",
+    custom = { method, _ ->
+        method.parameterTypes.firstOrNull()?.toString() == "I"
+    }
+)
+
+private object YtPivotBarSetSelectedFingerprint : Fingerprint(
+    definingClass = PIVOT_BAR_CLASS,
+    accessFlags = listOf(AccessFlags.PUBLIC, AccessFlags.FINAL),
+    returnType = "V",
+    parameters = listOf("I", "Z"),
+    filters = listOf(
+        methodCall(name = "setSelected")
+    )
+)
+
+private object YtFrostedGlassClassFingerprint : Fingerprint(
+    filters = listOf(
+        string("frostedGlassRenderNode")
+    )
+)
+
+private object YtFrostedGlassCreateBlurFingerprint : Fingerprint(
+    classFingerprint = YtFrostedGlassClassFingerprint,
+    filters = listOf(
+        methodCall(
+            smali = "Landroid/graphics/RenderEffect;->createBlurEffect(FFLandroid/graphics/Shader\$TileMode;)Landroid/graphics/RenderEffect;"
+        )
+    )
+)
+
+private object YtFrostedGlassDrawFingerprint : Fingerprint(
+    classFingerprint = YtFrostedGlassClassFingerprint,
+    name = "draw",
+    returnType = "V",
+    parameters = listOf("Landroid/graphics/Canvas;")
+)
+
 private val COMPATIBILITY_YOUTUBE_ANY = Compatibility(
     name = "YouTube",
     packageName = "com.google.android.youtube",
@@ -105,7 +184,6 @@ val removeTopBlackBarPatch = patch(
     extendWith("extensions/ytfullscreen.mpe")
 
     finalize {
-        // 1. Register activity lifecycle + window/insets edge-to-edge configuration on MainActivity.
         YtFullscreenMainActivityOnCreateFingerprint.let {
             it.clearMatch()
             it.method.addInstruction(
@@ -115,8 +193,6 @@ val removeTopBlackBarPatch = patch(
             )
         }
 
-        // 2. Unconditionally strip top stable inset for the video player (runs after official
-        //    Morphe's HideStatusBarPatch.getPlayerStableInsets if both patches are applied).
         YtFullscreenPlayerStableInsetsFingerprint.clearMatch()
         YtFullscreenPlayerStableInsetsFingerprint.matchOrNull()?.let { match ->
             match.method.apply {
@@ -145,8 +221,6 @@ val removeTopBlackBarPatch = patch(
             }
         }
 
-        // 3. Unconditionally strip top system window inset delivered to YouTube's top-anchored
-        //    containers (runs after official Morphe's setSystemWindowInsetTop if present).
         YtFullscreenSystemWindowInsetsFingerprint.clearMatch()
         YtFullscreenSystemWindowInsetsFingerprint.matchOrNull()?.let { match ->
             match.method.apply {
@@ -172,8 +246,6 @@ val removeTopBlackBarPatch = patch(
             }
         }
 
-        // 4. Collapse YouTube's internal status bar background overlay view (View.GONE + height 0)
-        //    instead of merely marking it INVISIBLE.
         YtFullscreenStatusBarBackgroundShowFingerprint.clearMatch()
         YtFullscreenStatusBarBackgroundShowFingerprint.matchOrNull()?.let { match ->
             match.method.apply {
@@ -218,4 +290,216 @@ val scrollAwayHomeToolbarPatch = patch(
             )
         }
     }
+}
+
+@Suppress("unused")
+val swapProfileWithLibraryPatch = patch(
+    name = "Swap profile photo with Library icon",
+    description = "Replaces the channel profile photo on the You tab in YouTube's navigation bar with a crisp Library icon that adapts to selection and dark/light themes.",
+    default = false
+) {
+    compatibleWith(COMPATIBILITY_YOUTUBE_ANY)
+    extendWith("extensions/ytfullscreen.mpe")
+
+    finalize {
+        YtFullscreenMainActivityOnCreateFingerprint.let {
+            it.clearMatch()
+            it.method.addInstruction(
+                0,
+                "invoke-static/range { p0 .. p0 }, " +
+                    "$EXTENSION_CLASS->onSwapProfileWithLibraryEnabled(Landroid/app/Activity;)V"
+            )
+        }
+
+        listOf(
+            YtPivotBarCreateResourceStyledViewFingerprint,
+            YtPivotBarCreateDrawableViewFingerprint,
+            YtPivotBarCreateResourceIntViewFingerprint
+        ).forEach { fp ->
+            fp.clearMatch()
+            fp.matchOrNull()?.method?.hookReturnedPivotTabView()
+        }
+
+        YtPivotBarSetSelectedFingerprint.clearMatch()
+        YtPivotBarSetSelectedFingerprint.matchOrNull()?.let { match ->
+            match.method.apply {
+                val index = match.instructionMatches.first().index
+                val call = getInstruction<FiveRegisterInstruction>(index)
+                val viewRegister = call.registerC
+                val selectedRegister = call.registerD
+
+                addInstruction(
+                    index + 1,
+                    "invoke-static { v$viewRegister, v$selectedRegister }, " +
+                        "$EXTENSION_CLASS->onPivotTabSelected(Landroid/view/View;Z)V"
+                )
+            }
+        }
+    }
+}
+
+@Suppress("unused")
+val glassNavBarBlurPatch = patch(
+    name = "Glass navigation bar blur",
+    description = "Adds an adjustable blur strength slider inside Morphe Navigation settings to customize or disable the blur of YouTube's glass navigation bar.",
+    default = false
+) {
+    compatibleWith(COMPATIBILITY_YOUTUBE_ANY)
+    extendWith("extensions/ytfullscreen.mpe")
+
+    execute {
+        val addOnFile = resourceFile(ADD_ON_PREFERENCES_FILE_PATH)
+        if (!addOnFile.exists()) {
+            addOnFile.writeText(
+                """
+                <?xml version="1.0" encoding="utf-8"?>
+                <morphe-add-on-preferences xmlns:android="http://schemas.android.com/apk/res/android">
+                </morphe-add-on-preferences>
+                """.trimIndent()
+            )
+        }
+
+        resourceXml(ADD_ON_PREFERENCES_FILE_PATH).use { xml ->
+            xml.root.appendChild("screen") {
+                appendChild(GLASS_BLUR_PREFERENCE_TAG) {
+                    setAttribute("android:key", GLASS_BLUR_PREFERENCE_KEY)
+                    setAttribute("android:title", "Glass navigation bar blur")
+                    setAttribute("android:selectable", "true")
+                }
+            }
+        }
+    }
+
+    finalize {
+        YtFullscreenMainActivityOnCreateFingerprint.let {
+            it.clearMatch()
+            it.method.addInstruction(
+                0,
+                "invoke-static/range { p0 .. p0 }, " +
+                    "$EXTENSION_CLASS->onGlassBlurEnabled(Landroid/app/Activity;)V"
+            )
+        }
+
+        // Hook RenderEffect.createBlurEffect(...) inside YouTube's frostedGlassRenderNode class
+        // and hook draw(Canvas) for instant live updates after adjusting the slider in Settings.
+        YtFrostedGlassClassFingerprint.clearMatch()
+        if (YtFrostedGlassClassFingerprint.matchOrNull() != null) {
+            YtFrostedGlassCreateBlurFingerprint.clearMatch()
+            runCatching { YtFrostedGlassCreateBlurFingerprint.matchAll() }
+                .getOrNull()
+                ?.forEach { blurMatch ->
+                    val method = blurMatch.method
+                    val instrs = method.implementation?.instructions?.toList() ?: return@forEach
+                    for (i in instrs.indices.reversed()) {
+                        val insn = instrs[i]
+                        if (insn.opcode != Opcode.INVOKE_STATIC && insn.opcode != Opcode.INVOKE_STATIC_RANGE) {
+                            continue
+                        }
+                        val ref = (insn as? ReferenceInstruction)?.getReference<MethodReference>() ?: continue
+                        if (ref.definingClass == "Landroid/graphics/RenderEffect;"
+                            && ref.name == "createBlurEffect"
+                            && ref.parameterTypes.size == 3
+                            && ref.parameterTypes[0].toString() == "F"
+                            && ref.parameterTypes[1].toString() == "F"
+                            && ref.parameterTypes[2].toString() == "Landroid/graphics/Shader\$TileMode;"
+                        ) {
+                            if (insn.opcode == Opcode.INVOKE_STATIC) {
+                                val five = insn as FiveRegisterInstruction
+                                method.replaceInstruction(
+                                    i,
+                                    "invoke-static { v${five.registerC}, v${five.registerD}, v${five.registerE} }, " +
+                                        "$EXTENSION_CLASS->createGlassBlurEffect(FFLandroid/graphics/Shader\$TileMode;)Landroid/graphics/RenderEffect;"
+                                )
+                            } else {
+                                val range = insn as RegisterRangeInstruction
+                                val start = range.startRegister
+                                val end = start + range.registerCount - 1
+                                method.replaceInstruction(
+                                    i,
+                                    "invoke-static/range { v$start .. v$end }, " +
+                                        "$EXTENSION_CLASS->createGlassBlurEffect(FFLandroid/graphics/Shader\$TileMode;)Landroid/graphics/RenderEffect;"
+                                )
+                            }
+                        }
+                    }
+                }
+
+            YtFrostedGlassDrawFingerprint.clearMatch()
+            YtFrostedGlassDrawFingerprint.matchOrNull()?.let { drawMatch ->
+                drawMatch.method.addInstruction(
+                    0,
+                    "invoke-static/range { p0 .. p0 }, " +
+                        "$EXTENSION_CLASS->onFrostedGlassDraw(Ljava/lang/Object;)V"
+                )
+            }
+        }
+
+        // Add the "Glass navigation bar blur" slider preference into Morphe Settings -> Navigation
+        // right alongside official Morphe's glass navigation bar options.
+        var injectedIntoPrefs = false
+        arrayOf(
+            "res/xml/morphe_prefs.xml",
+            "res/xml/morphe_prefs_icons.xml",
+            "res/xml/morphe_prefs_icons_bold.xml"
+        ).forEach { prefPath ->
+            resourceXmlOrNull(prefPath)?.use { xml ->
+                val rootNode = xml.elements("PreferenceScreen").firstOrNull() ?: return@use
+                injectedIntoPrefs = true
+                if (rootNode.findByKey(GLASS_BLUR_PREFERENCE_KEY) != null) {
+                    return@use
+                }
+                val targetGroup = rootNode.findParentOfKey("morphe_navigation_bar_glass_opacity")
+                    ?: rootNode.findParentOfKey("morphe_navigation_bar_glass")
+                    ?: rootNode
+
+                targetGroup.appendChild(GLASS_BLUR_PREFERENCE_TAG) {
+                    setAttribute("android:key", GLASS_BLUR_PREFERENCE_KEY)
+                    setAttribute("android:title", "Glass navigation bar blur")
+                    setAttribute("android:selectable", "true")
+                }
+            }
+        }
+
+        val addOnFile = resourceFile(ADD_ON_PREFERENCES_FILE_PATH)
+        if (injectedIntoPrefs && addOnFile.exists()) {
+            addOnFile.delete()
+        }
+    }
+}
+
+private fun MutableMethod.hookReturnedPivotTabView() {
+    val instrs = implementation?.instructions?.toList() ?: return
+    for (i in instrs.indices.reversed()) {
+        val insn = instrs[i]
+        if (insn.opcode == Opcode.RETURN_OBJECT) {
+            val reg = (insn as OneRegisterInstruction).registerA
+            addInstruction(
+                i,
+                "invoke-static/range { v$reg .. v$reg }, " +
+                    "$EXTENSION_CLASS->onPivotTabCreated(Landroid/view/View;)V"
+            )
+        }
+    }
+}
+
+private fun XmlElement.findByKey(key: String): XmlElement? {
+    children.forEach { element ->
+        val elementKey = element.attribute("android:key").orEmpty()
+        if (elementKey == key || elementKey.startsWith("${key}_sort_by")) {
+            return element
+        }
+        element.findByKey(key)?.let { return it }
+    }
+    return null
+}
+
+private fun XmlElement.findParentOfKey(key: String): XmlElement? {
+    children.forEach { element ->
+        val elementKey = element.attribute("android:key").orEmpty()
+        if (elementKey == key) {
+            return this
+        }
+        element.findParentOfKey(key)?.let { return it }
+    }
+    return null
 }

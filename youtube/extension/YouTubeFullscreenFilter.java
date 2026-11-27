@@ -2,13 +2,24 @@ package app.morphe.extension.youtube.patches.fullscreen;
 
 import android.app.Activity;
 import android.app.Application;
+import android.content.Context;
+import android.content.SharedPreferences;
+import android.content.res.Configuration;
 import android.content.res.Resources;
+import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Insets;
+import android.graphics.Paint;
+import android.graphics.Path;
 import android.graphics.Rect;
+import android.graphics.RectF;
+import android.graphics.RenderEffect;
+import android.graphics.RenderNode;
+import android.graphics.Shader;
 import android.os.Build;
 import android.os.Bundle;
 import android.view.DisplayCutout;
+import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewTreeObserver;
@@ -17,7 +28,9 @@ import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.TextView;
 import android.widget.Toolbar;
 
 import java.lang.ref.WeakReference;
@@ -28,14 +41,18 @@ import java.util.HashMap;
 import java.util.WeakHashMap;
 
 /**
- * Independent YouTube fullscreen & Home toolbar helper engineered for zero scroll overhead:
- * - Zero per-frame hooks (no OnPreDrawListener, no OnGlobalLayoutListener during scroll).
- * - Zero view-tree walks, findViewById calls, reflection, or LayoutParams mutations during scroll.
- * - Purely event-driven: runs only on Activity lifecycle, window focus, window resize/rotation,
- *   WindowInsets dispatch, and idle (top == 0) AppBarLayout chrome updates.
+ * Independent YouTube add-on helper engineered for zero scroll overhead:
+ * 1. Remove top black bar (event-driven edge-to-edge + inset stripping + status-bar collapse).
+ * 2. Scroll away home toolbar (AppBarLayout SCROLL_FLAG_SCROLL when at rest on Home).
+ * 3. Swap profile photo with Library icon (replaces You tab avatar with crisp vector Library icon).
+ * 4. Glass navigation bar blur (adjustable RenderEffect blur radius with live Morphe Settings slider).
  */
 @SuppressWarnings("unused")
 public final class YouTubeFullscreenFilter {
+
+    private static final String PREFS_NAME = "morphe_yt_addon_prefs";
+    private static final String KEY_GLASS_BLUR_DP = "glass_nav_blur_dp";
+    private static final String LIBRARY_ICON_TAG = "morphe_yt_library_icon_view";
 
     private static final int SCROLL_FLAG_SCROLL = 0x1;
     private static final long APPBAR_UPDATE_DEBOUNCE_MS = 60L;
@@ -72,25 +89,47 @@ public final class YouTubeFullscreenFilter {
             "bottom_bar_container"
     };
 
+    private static final String[] YOU_TAB_AVATAR_CONTAINER_NAMES = {
+            "thumbnail_layout",
+            "avatar_layout",
+            "account_avatar_container"
+    };
+
     private static final WeakHashMap<Activity, ActivityState> STATES = new WeakHashMap<>();
     private static final HashMap<Class<?>, ScrollFlagsAccessor> SCROLL_FLAGS_CACHE = new HashMap<>();
     private static final HashMap<Class<?>, Method> TOOLBAR_GET_TITLE_CACHE = new HashMap<>();
+    private static final HashMap<Class<?>, Field> RENDER_NODE_FIELD_CACHE = new HashMap<>();
     private static final ScrollFlagsAccessor NO_ACCESSOR = new ScrollFlagsAccessor(null, null, null);
     private static final Method NO_METHOD;
+    private static final Field NO_FIELD;
 
     static {
-        Method sentinel = null;
+        Method mSentinel = null;
+        Field fSentinel = null;
         try {
-            sentinel = Object.class.getMethod("toString");
+            mSentinel = Object.class.getMethod("toString");
+            fSentinel = YouTubeFullscreenFilter.class.getDeclaredField("PREFS_NAME");
         } catch (Throwable ignored) {
         }
-        NO_METHOD = sentinel;
+        NO_METHOD = mSentinel;
+        NO_FIELD = fSentinel;
     }
 
     private static volatile boolean removeTopBlackBarEnabled = false;
     private static volatile boolean homeScrollToolbarEnabled = false;
+    private static volatile boolean swapProfileWithLibraryEnabled = false;
+    private static volatile boolean glassBlurEnabled = false;
     private static volatile boolean lifecycleRegistered = false;
     private static volatile WeakReference<Activity> currentActivityRef = new WeakReference<>(null);
+
+    // Glass navigation bar blur state (fast O(1) volatile check during draw).
+    private static volatile int savedGlassBlurDp = -1; // -1 = App default, 0 = Off, 1..60 = custom dp
+    private static volatile boolean glassBlurPrefLoaded = false;
+    private static volatile int glassBlurRevision = 0;
+    private static volatile float appDensity = 2.0f;
+    private static volatile float detectedDefaultBlurPx = -1f;
+    private static WeakReference<Object> lastFrostedDrawableRef = new WeakReference<>(null);
+    private static int lastFrostedDrawableRevision = -1;
 
     // Process-wide cached resource IDs (resolved once, never during scroll).
     private static volatile boolean idsResolved = false;
@@ -98,6 +137,8 @@ public final class YouTubeFullscreenFilter {
     private static int[] statusBarSpacerIds = new int[0];
     private static int[] appBarIds = new int[0];
     private static int[] navBarIds = new int[0];
+    private static int[] youTabAvatarContainerIds = new int[0];
+    private static int tabLabelTextId = 0;
     private static int cachedStatusBarHeightPx = -1;
 
     private static final class ScrollFlagsAccessor {
@@ -162,17 +203,17 @@ public final class YouTubeFullscreenFilter {
     private YouTubeFullscreenFilter() {
     }
 
+    // -------------------------------------------------------------------------
+    // Patch entry points
+    // -------------------------------------------------------------------------
+
     /**
      * Hooked at index 0 of YouTube's MainActivity.onCreate(Bundle) by "Remove top black bar".
      * Never touches getWindow()/getDecorView() synchronously before super.onCreate().
      */
     public static void onMainActivityCreated(Activity activity) {
         removeTopBlackBarEnabled = true;
-        if (activity == null) {
-            return;
-        }
-        currentActivityRef = new WeakReference<>(activity);
-        registerLifecycleOnce(activity);
+        initActivityHook(activity);
     }
 
     /**
@@ -180,12 +221,498 @@ public final class YouTubeFullscreenFilter {
      */
     public static void onHomeScrollToolbarEnabled(Activity activity) {
         homeScrollToolbarEnabled = true;
+        initActivityHook(activity);
+    }
+
+    /**
+     * Hooked at index 0 of YouTube's MainActivity.onCreate(Bundle) by "Swap profile photo with Library icon".
+     */
+    public static void onSwapProfileWithLibraryEnabled(Activity activity) {
+        swapProfileWithLibraryEnabled = true;
+        initActivityHook(activity);
+    }
+
+    /**
+     * Hooked at index 0 of YouTube's MainActivity.onCreate(Bundle) by "Glass navigation bar blur".
+     */
+    public static void onGlassBlurEnabled(Activity activity) {
+        glassBlurEnabled = true;
+        initActivityHook(activity);
+        if (activity != null) {
+            ensureGlassBlurPrefLoaded(activity);
+        }
+    }
+
+    private static void initActivityHook(Activity activity) {
         if (activity == null) {
             return;
         }
         currentActivityRef = new WeakReference<>(activity);
+        try {
+            Resources res = activity.getResources();
+            if (res != null) {
+                appDensity = res.getDisplayMetrics().density;
+                resolveResourceIdsOnce(res, activity.getPackageName());
+            }
+        } catch (Throwable ignored) {
+        }
         registerLifecycleOnce(activity);
     }
+
+    // -------------------------------------------------------------------------
+    // Glass navigation bar blur preference + RenderEffect hooks
+    // -------------------------------------------------------------------------
+
+    public static int getGlassBlurDp(Context context) {
+        ensureGlassBlurPrefLoaded(context);
+        return savedGlassBlurDp;
+    }
+
+    public static int getDetectedDefaultBlurDp(Context context) {
+        float d = appDensity;
+        if (context != null && context.getResources() != null) {
+            d = context.getResources().getDisplayMetrics().density;
+            appDensity = d;
+        }
+        if (detectedDefaultBlurPx > 0f && d > 0f) {
+            return Math.round(detectedDefaultBlurPx / d);
+        }
+        return 25;
+    }
+
+    public static void setGlassBlurDp(Context context, int blurDp) {
+        int normalized = blurDp < 0 ? -1 : Math.max(0, Math.min(60, blurDp));
+        savedGlassBlurDp = normalized;
+        glassBlurPrefLoaded = true;
+        glassBlurRevision++;
+        if (context != null) {
+            try {
+                if (context.getResources() != null) {
+                    appDensity = context.getResources().getDisplayMetrics().density;
+                }
+                SharedPreferences prefs = context.getApplicationContext()
+                        .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+                prefs.edit().putInt(KEY_GLASS_BLUR_DP, normalized).apply();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private static void ensureGlassBlurPrefLoaded(Context context) {
+        if (glassBlurPrefLoaded || context == null) {
+            return;
+        }
+        try {
+            if (context.getResources() != null) {
+                appDensity = context.getResources().getDisplayMetrics().density;
+            }
+            SharedPreferences prefs = context.getApplicationContext()
+                    .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+            savedGlassBlurDp = prefs.getInt(KEY_GLASS_BLUR_DP, -1);
+            glassBlurPrefLoaded = true;
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * Replaces RenderEffect.createBlurEffect(rx, ry, tileMode) inside YouTube's
+     * "frostedGlassRenderNode" drawable class.
+     */
+    public static RenderEffect createGlassBlurEffect(float origX, float origY, Shader.TileMode tileMode) {
+        if (Build.VERSION.SDK_INT < 31) {
+            return null;
+        }
+        if (origX > 0f) {
+            detectedDefaultBlurPx = origX;
+        }
+        Shader.TileMode safeMode = tileMode != null ? tileMode : Shader.TileMode.CLAMP;
+        if (!glassBlurEnabled) {
+            return RenderEffect.createBlurEffect(origX, origY, safeMode);
+        }
+        int blurDp = savedGlassBlurDp;
+        if (blurDp < 0) {
+            return RenderEffect.createBlurEffect(origX, origY, safeMode);
+        }
+        if (blurDp == 0) {
+            // Non-null minimal blur so RenderEffect.createChainEffect never receives null.
+            return RenderEffect.createBlurEffect(0.01f, 0.01f, safeMode);
+        }
+        float px = Math.max(0.5f, blurDp * appDensity);
+        return RenderEffect.createBlurEffect(px, px, safeMode);
+    }
+
+    /**
+     * Hooked at index 0 of draw(Canvas) on YouTube's "frostedGlassRenderNode" drawable.
+     * Fast path is a single reference + int comparison (~1 ns) so scrolling has zero overhead;
+     * when the user changes the blur slider in Settings, updates RenderNode.setRenderEffect live.
+     */
+    public static void onFrostedGlassDraw(Object drawable) {
+        if (!glassBlurEnabled || drawable == null || Build.VERSION.SDK_INT < 31) {
+            return;
+        }
+        int rev = glassBlurRevision;
+        if (drawable == lastFrostedDrawableRef.get() && lastFrostedDrawableRevision == rev) {
+            return;
+        }
+        lastFrostedDrawableRef = new WeakReference<>(drawable);
+        lastFrostedDrawableRevision = rev;
+
+        int blurDp = savedGlassBlurDp;
+        // On initial revision 0 with App default (-1), keep YouTube's native RenderEffect untouched.
+        if (rev == 0 && blurDp < 0) {
+            return;
+        }
+
+        Field nodeField = getCachedRenderNodeField(drawable.getClass());
+        if (nodeField == null) {
+            return;
+        }
+        try {
+            Object rawNode = nodeField.get(drawable);
+            if (!(rawNode instanceof RenderNode)) {
+                return;
+            }
+            RenderNode node = (RenderNode) rawNode;
+            if (blurDp == 0) {
+                node.setRenderEffect(null);
+            } else {
+                float px;
+                if (blurDp < 0) {
+                    px = detectedDefaultBlurPx > 0f ? detectedDefaultBlurPx : (25f * appDensity);
+                } else {
+                    px = Math.max(0.5f, blurDp * appDensity);
+                }
+                node.setRenderEffect(RenderEffect.createBlurEffect(px, px, Shader.TileMode.CLAMP));
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static Field getCachedRenderNodeField(Class<?> cls) {
+        synchronized (RENDER_NODE_FIELD_CACHE) {
+            Field cached = RENDER_NODE_FIELD_CACHE.get(cls);
+            if (cached != null) {
+                return cached == NO_FIELD ? null : cached;
+            }
+        }
+        Field resolved = null;
+        if (Build.VERSION.SDK_INT >= 29) {
+            Class<?> c = cls;
+            while (c != null && c != Object.class) {
+                Field[] fields = c.getDeclaredFields();
+                for (int i = 0; i < fields.length; i++) {
+                    Field f = fields[i];
+                    if (RenderNode.class.isAssignableFrom(f.getType())) {
+                        try {
+                            f.setAccessible(true);
+                            resolved = f;
+                            break;
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }
+                if (resolved != null) {
+                    break;
+                }
+                c = c.getSuperclass();
+            }
+        }
+        synchronized (RENDER_NODE_FIELD_CACHE) {
+            RENDER_NODE_FIELD_CACHE.put(cls, resolved != null ? resolved : NO_FIELD);
+        }
+        return resolved;
+    }
+
+    // -------------------------------------------------------------------------
+    // Swap profile photo with Library icon hooks
+    // -------------------------------------------------------------------------
+
+    /**
+     * Hooked right before RETURN_OBJECT of PivotBar button creation methods.
+     */
+    public static void onPivotTabCreated(final View tabView) {
+        if (!swapProfileWithLibraryEnabled || tabView == null) {
+            return;
+        }
+        try {
+            Context ctx = tabView.getContext();
+            if (ctx != null) {
+                resolveResourceIdsOnce(ctx.getResources(), ctx.getPackageName());
+            }
+            if (swapYouTabToLibraryIcon(tabView)) {
+                // Run once more after current message loop in case YouTube binds avatar views
+                // immediately after returning the newly inflated tab view.
+                tabView.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        swapYouTabToLibraryIcon(tabView);
+                    }
+                });
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * Hooked right after setSelected(boolean) inside PivotBar.
+     */
+    public static void onPivotTabSelected(View tabView, boolean isSelected) {
+        if (!swapProfileWithLibraryEnabled || tabView == null) {
+            return;
+        }
+        try {
+            ViewGroup avatarContainer = findYouTabAvatarContainer(tabView);
+            if (avatarContainer == null) {
+                return;
+            }
+            swapYouTabToLibraryIcon(tabView);
+            View icon = avatarContainer.findViewWithTag(LIBRARY_ICON_TAG);
+            if (icon instanceof LibraryIconView) {
+                ((LibraryIconView) icon).setTabSelected(isSelected);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void scanNavBarForYouTab(View decor, ActivityState state) {
+        if (!swapProfileWithLibraryEnabled || decor == null) {
+            return;
+        }
+        ViewGroup navBar = findNavBarFast(decor, state);
+        if (navBar == null) {
+            return;
+        }
+        ViewGroup tabsContainer = unwrapTabsContainer(navBar);
+        int count = tabsContainer.getChildCount();
+        for (int i = 0; i < count; i++) {
+            View tab = tabsContainer.getChildAt(i);
+            if (tab != null) {
+                swapYouTabToLibraryIcon(tab);
+            }
+        }
+    }
+
+    private static boolean swapYouTabToLibraryIcon(View tabView) {
+        ViewGroup avatarContainer = findYouTabAvatarContainer(tabView);
+        if (avatarContainer == null) {
+            return false;
+        }
+
+        boolean isLinear = avatarContainer instanceof LinearLayout;
+        int origW = 0;
+        int origH = 0;
+        LibraryIconView existingIcon = null;
+
+        int childCount = avatarContainer.getChildCount();
+        for (int i = 0; i < childCount; i++) {
+            View child = avatarContainer.getChildAt(i);
+            if (child == null) {
+                continue;
+            }
+            if (child instanceof LibraryIconView && LIBRARY_ICON_TAG.equals(child.getTag())) {
+                existingIcon = (LibraryIconView) child;
+                continue;
+            }
+            ViewGroup.LayoutParams clp = child.getLayoutParams();
+            if (clp != null) {
+                if (origW <= 0 && clp.width > 0) {
+                    origW = clp.width;
+                }
+                if (origH <= 0 && clp.height > 0) {
+                    origH = clp.height;
+                }
+            }
+            // Keep original avatar/ring children hidden even if Glide reloads the bitmap asynchronously.
+            if (child.getAlpha() != 0f) {
+                child.setAlpha(0f);
+            }
+            if (child.getScaleX() != 0f) {
+                child.setScaleX(0f);
+            }
+            if (child.getScaleY() != 0f) {
+                child.setScaleY(0f);
+            }
+            int hiddenVis = isLinear ? View.GONE : View.INVISIBLE;
+            if (child.getVisibility() != hiddenVis) {
+                child.setVisibility(hiddenVis);
+            }
+        }
+
+        TextView labelView = null;
+        if (tabLabelTextId != 0) {
+            View tv = tabView.findViewById(tabLabelTextId);
+            if (tv instanceof TextView) {
+                labelView = (TextView) tv;
+            }
+        }
+
+        if (existingIcon == null) {
+            Context ctx = avatarContainer.getContext();
+            int sizePx = dpToPx(ctx.getResources(), 24);
+            int targetW = origW > 0 ? origW : sizePx;
+            int targetH = origH > 0 ? origH : sizePx;
+
+            LibraryIconView iconView = new LibraryIconView(ctx, labelView);
+            iconView.setTag(LIBRARY_ICON_TAG);
+            iconView.setDuplicateParentStateEnabled(true);
+            iconView.setTabSelected(tabView.isSelected());
+
+            ViewGroup.LayoutParams iconLp;
+            if (avatarContainer instanceof FrameLayout) {
+                iconLp = new FrameLayout.LayoutParams(targetW, targetH, Gravity.CENTER);
+            } else if (avatarContainer instanceof LinearLayout) {
+                LinearLayout.LayoutParams llp = new LinearLayout.LayoutParams(targetW, targetH);
+                llp.gravity = Gravity.CENTER;
+                iconLp = llp;
+            } else {
+                iconLp = new ViewGroup.LayoutParams(targetW, targetH);
+            }
+            avatarContainer.addView(iconView, iconLp);
+        } else {
+            existingIcon.updateLabelRef(labelView);
+            existingIcon.setTabSelected(tabView.isSelected());
+        }
+        return true;
+    }
+
+    private static ViewGroup findYouTabAvatarContainer(View tabView) {
+        if (tabView == null) {
+            return null;
+        }
+        for (int i = 0; i < youTabAvatarContainerIds.length; i++) {
+            View v = tabView.findViewById(youTabAvatarContainerIds[i]);
+            if (v instanceof ViewGroup) {
+                return (ViewGroup) v;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Crisp hardware-accelerated vector Video Library icon (24dp grid):
+     * - Unselected: outlined stacked media card with crisp play triangle & bottom-left shelf.
+     * - Selected: solid filled rounded card with EVEN_ODD transparent cut-out play triangle & shelf.
+     */
+    private static final class LibraryIconView extends View {
+        private final Paint strokePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint fillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Path workPath = new Path();
+        private final Path shelfPath = new Path();
+        private final RectF cardRect = new RectF();
+        private WeakReference<TextView> siblingLabelRef;
+        private boolean selectedState = false;
+
+        LibraryIconView(Context context, TextView siblingLabel) {
+            super(context);
+            this.siblingLabelRef = new WeakReference<>(siblingLabel);
+            strokePaint.setStyle(Paint.Style.STROKE);
+            strokePaint.setStrokeCap(Paint.Cap.ROUND);
+            strokePaint.setStrokeJoin(Paint.Join.ROUND);
+            fillPaint.setStyle(Paint.Style.FILL);
+        }
+
+        void updateLabelRef(TextView siblingLabel) {
+            if (siblingLabel != null) {
+                this.siblingLabelRef = new WeakReference<>(siblingLabel);
+            }
+        }
+
+        void setTabSelected(boolean selected) {
+            if (this.selectedState != selected) {
+                this.selectedState = selected;
+                invalidate();
+            }
+        }
+
+        @Override
+        protected void drawableStateChanged() {
+            super.drawableStateChanged();
+            boolean nowSelected = isSelected();
+            if (nowSelected != selectedState) {
+                selectedState = nowSelected;
+                invalidate();
+            }
+        }
+
+        private int resolveIconColor() {
+            TextView tv = siblingLabelRef != null ? siblingLabelRef.get() : null;
+            if (tv != null && tv.isAttachedToWindow()) {
+                int c = tv.getCurrentTextColor();
+                if ((c >>> 24) > 0x20) {
+                    return c;
+                }
+            }
+            int mode = getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK;
+            boolean dark = mode == Configuration.UI_MODE_NIGHT_YES;
+            return dark ? Color.WHITE : 0xFF0F0F0F;
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            int w = getWidth();
+            int h = getHeight();
+            if (w <= 0 || h <= 0) {
+                return;
+            }
+
+            float size = Math.min(w, h);
+            float scale = size / 24f;
+            float ox = (w - size) * 0.5f;
+            float oy = (h - size) * 0.5f;
+
+            int color = resolveIconColor();
+            strokePaint.setColor(color);
+            fillPaint.setColor(color);
+
+            canvas.save();
+            canvas.translate(ox, oy);
+
+            // Front rounded media card bounds in 24x24 coordinates: (5.2, 3.2) .. (20.8, 16.8)
+            cardRect.set(5.2f * scale, 3.2f * scale, 20.8f * scale, 16.8f * scale);
+            float cornerR = 2.1f * scale;
+
+            // Bottom-left stacked library shelf L-curve: (2.8, 7.2) -> (2.8, 18.6) -> (17.2, 20.4)
+            shelfPath.reset();
+            shelfPath.moveTo(2.8f * scale, 7.4f * scale);
+            shelfPath.lineTo(2.8f * scale, 18.2f * scale);
+            shelfPath.quadTo(2.8f * scale, 20.4f * scale, 5.0f * scale, 20.4f * scale);
+            shelfPath.lineTo(17.2f * scale, 20.4f * scale);
+
+            if (selectedState || isSelected()) {
+                // Filled card with EVEN_ODD transparent cut-out play triangle so glass shines through.
+                workPath.reset();
+                workPath.setFillType(Path.FillType.EVEN_ODD);
+                workPath.addRoundRect(cardRect, cornerR, cornerR, Path.Direction.CW);
+                workPath.moveTo(11.0f * scale, 6.9f * scale);
+                workPath.lineTo(11.0f * scale, 13.1f * scale);
+                workPath.lineTo(16.2f * scale, 10.0f * scale);
+                workPath.close();
+                canvas.drawPath(workPath, fillPaint);
+
+                strokePaint.setStrokeWidth(1.85f * scale);
+                canvas.drawPath(shelfPath, strokePaint);
+            } else {
+                // Outlined card + crisp filled play triangle + stacked shelf stroke.
+                strokePaint.setStrokeWidth(1.65f * scale);
+                canvas.drawRoundRect(cardRect, cornerR, cornerR, strokePaint);
+                canvas.drawPath(shelfPath, strokePaint);
+
+                workPath.reset();
+                workPath.setFillType(Path.FillType.WINDING);
+                workPath.moveTo(11.2f * scale, 7.2f * scale);
+                workPath.lineTo(11.2f * scale, 12.8f * scale);
+                workPath.lineTo(15.9f * scale, 10.0f * scale);
+                workPath.close();
+                canvas.drawPath(workPath, fillPaint);
+            }
+
+            canvas.restore();
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Top black bar inset hooks
+    // -------------------------------------------------------------------------
 
     /**
      * Hooked after YouTube reads stable insets for the player (and after official Morphe's
@@ -248,6 +775,10 @@ public final class YouTubeFullscreenFilter {
         } catch (Throwable ignored) {
         }
     }
+
+    // -------------------------------------------------------------------------
+    // Activity lifecycle & zero-jitter event listeners
+    // -------------------------------------------------------------------------
 
     private static void registerLifecycleOnce(Activity activity) {
         if (lifecycleRegistered) {
@@ -357,6 +888,8 @@ public final class YouTubeFullscreenFilter {
             statusBarSpacerIds = resolveIdArray(res, pkg, STATUS_BAR_SPACER_NAMES);
             appBarIds = resolveIdArray(res, pkg, APP_BAR_NAMES);
             navBarIds = resolveIdArray(res, pkg, NAV_BAR_NAMES);
+            youTabAvatarContainerIds = resolveIdArray(res, pkg, YOU_TAB_AVATAR_CONTAINER_NAMES);
+            tabLabelTextId = res.getIdentifier("text", "id", pkg);
             cachedStatusBarHeightPx = readStatusBarHeightPx(res);
             idsResolved = true;
         }
@@ -430,6 +963,9 @@ public final class YouTubeFullscreenFilter {
             return;
         }
         resolveResourceIdsOnce(activity.getResources(), activity.getPackageName());
+        if (glassBlurEnabled) {
+            ensureGlassBlurPrefLoaded(activity);
+        }
 
         final ActivityState state = getState(activity);
         if (removeTopBlackBarEnabled && !isFloatingOrSplitMode(activity)) {
@@ -447,8 +983,6 @@ public final class YouTubeFullscreenFilter {
 
         installDecorEventListeners(activity, decor, state);
 
-        // Post inset stripper & toolbar setup so we attach AFTER upstream Morphe's
-        // HideStatusBarPatch.addDisplayCutoutInset listener on android.R.id.content.
         final WeakReference<Activity> actRef = new WeakReference<>(activity);
         decor.post(new Runnable() {
             @Override
@@ -468,8 +1002,6 @@ public final class YouTubeFullscreenFilter {
         }
         final WeakReference<Activity> actRef = new WeakReference<>(activity);
 
-        // Fires ONLY when the window dimensions actually change (rotation, fullscreen toggle,
-        // or split-screen resize). Never does any work during feed scrolling.
         state.decorResizeListener = new View.OnLayoutChangeListener() {
             @Override
             public void onLayoutChange(
@@ -494,6 +1026,9 @@ public final class YouTubeFullscreenFilter {
                 }
                 if (homeScrollToolbarEnabled) {
                     attachAndSyncAppBar(act, state);
+                }
+                if (swapProfileWithLibraryEnabled) {
+                    scanNavBarForYouTab(decor, state);
                 }
             }
         };
@@ -521,38 +1056,44 @@ public final class YouTubeFullscreenFilter {
     }
 
     private static void applyEventDrivenFixes(Activity activity, final ActivityState state) {
+        Window window = activity.getWindow();
+        final View decor = window != null ? window.getDecorView() : null;
+
         if (removeTopBlackBarEnabled && !isFloatingOrSplitMode(activity)) {
             configureWindow(activity);
             installInsetStrippers(activity, state);
             cleanRootTopInsets(activity, state);
         }
 
+        if (swapProfileWithLibraryEnabled && decor != null) {
+            scanNavBarForYouTab(decor, state);
+        }
+
         if (homeScrollToolbarEnabled) {
             boolean attached = attachAndSyncAppBar(activity, state);
-            if (!attached && state.coldStartRetries < MAX_COLD_START_RETRIES) {
-                Window window = activity.getWindow();
-                final View decor = window != null ? window.getDecorView() : null;
-                if (decor != null) {
-                    state.coldStartRetries++;
-                    final WeakReference<Activity> actRef = new WeakReference<>(activity);
-                    if (state.coldStartRetryRunnable != null) {
-                        decor.removeCallbacks(state.coldStartRetryRunnable);
-                    }
-                    state.coldStartRetryRunnable = new Runnable() {
-                        @Override
-                        public void run() {
-                            Activity act = actRef.get();
-                            if (act == null || act.isFinishing() || act.isDestroyed()) {
-                                return;
-                            }
-                            if (!attachAndSyncAppBar(act, state) && state.coldStartRetries < MAX_COLD_START_RETRIES) {
-                                state.coldStartRetries++;
-                                decor.postDelayed(this, 450L);
-                            }
-                        }
-                    };
-                    decor.postDelayed(state.coldStartRetryRunnable, 450L);
+            if (!attached && decor != null && state.coldStartRetries < MAX_COLD_START_RETRIES) {
+                state.coldStartRetries++;
+                final WeakReference<Activity> actRef = new WeakReference<>(activity);
+                if (state.coldStartRetryRunnable != null) {
+                    decor.removeCallbacks(state.coldStartRetryRunnable);
                 }
+                state.coldStartRetryRunnable = new Runnable() {
+                    @Override
+                    public void run() {
+                        Activity act = actRef.get();
+                        if (act == null || act.isFinishing() || act.isDestroyed()) {
+                            return;
+                        }
+                        if (swapProfileWithLibraryEnabled) {
+                            scanNavBarForYouTab(decor, state);
+                        }
+                        if (!attachAndSyncAppBar(act, state) && state.coldStartRetries < MAX_COLD_START_RETRIES) {
+                            state.coldStartRetries++;
+                            decor.postDelayed(this, 450L);
+                        }
+                    }
+                };
+                decor.postDelayed(state.coldStartRetryRunnable, 450L);
             }
         }
     }
@@ -669,8 +1210,6 @@ public final class YouTubeFullscreenFilter {
         }
 
         if (content != null) {
-            // Intentionally replaces any listener set by upstream HideStatusBarPatch.addDisplayCutoutInset
-            // which otherwise adds top cutout padding to android.R.id.content.
             content.setOnApplyWindowInsetsListener(new View.OnApplyWindowInsetsListener() {
                 @Override
                 public WindowInsets onApplyWindowInsets(View v, WindowInsets insets) {
@@ -810,10 +1349,6 @@ public final class YouTubeFullscreenFilter {
         }
     }
 
-    /**
-     * One-shot root container cleanup executed ONLY on resume, window focus, or window resize.
-     * Never called during scrolling.
-     */
     private static void cleanRootTopInsets(Activity activity, ActivityState state) {
         Window window = activity.getWindow();
         if (window == null) {
@@ -925,7 +1460,6 @@ public final class YouTubeFullscreenFilter {
                     if (act == null || bar == null || act.isFinishing() || act.isDestroyed()) {
                         return;
                     }
-                    // Never mutate AppBarLayout LayoutParams while scrolled off-screen mid-fling.
                     if (bar.getTop() < 0) {
                         return;
                     }
@@ -940,8 +1474,6 @@ public final class YouTubeFullscreenFilter {
                         int left, int top, int right, int bottom,
                         int oldLeft, int oldTop, int oldRight, int oldBottom
                 ) {
-                    // Skip while scrolled partway or fully off-screen; only sync when toolbar is
-                    // at rest at top == 0 (e.g., tab switch, Search open, sub-page navigation).
                     if (top < 0) {
                         return;
                     }
@@ -1210,7 +1742,7 @@ public final class YouTubeFullscreenFilter {
         return null;
     }
 
-    private static int findSelectedNavTabIndex(ViewGroup navBar) {
+    private static ViewGroup unwrapTabsContainer(ViewGroup navBar) {
         ViewGroup tabsContainer = navBar;
         for (int unwrap = 0; unwrap < 3; unwrap++) {
             if (tabsContainer.getChildCount() == 1 && tabsContainer.getChildAt(0) instanceof ViewGroup) {
@@ -1219,6 +1751,11 @@ public final class YouTubeFullscreenFilter {
                 break;
             }
         }
+        return tabsContainer;
+    }
+
+    private static int findSelectedNavTabIndex(ViewGroup navBar) {
+        ViewGroup tabsContainer = unwrapTabsContainer(navBar);
         int visibleTabIdx = 0;
         int count = tabsContainer.getChildCount();
         for (int i = 0; i < count; i++) {

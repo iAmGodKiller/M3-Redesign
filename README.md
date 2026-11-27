@@ -11,6 +11,8 @@ A standalone **Material 3 Expressive** navigation bar and miniplayer redesign ad
 - **`M3 Redesign addon`** *(YouTube Music, stable — off by default after patching; enable in Morphe Settings)*
 - **`Remove top black bar`** *(YouTube, stable — standalone edge-to-edge patch for portrait video playback on tablets & phones when hiding the status bar)*
 - **`Scroll away home toolbar`** *(YouTube, stable — makes the Home screen top toolbar scroll away like the top of the page instead of staying persistent)*
+- **`Swap profile photo with Library icon`** *(YouTube, stable — replaces the You tab channel profile photo in the navigation bar with a theme-aware Library icon)*
+- **`Glass navigation bar blur`** *(YouTube, stable — adds an adjustable blur strength slider in Morphe Navigation settings for the glass navigation bar)*
 - **`Transparent status bar`** *(YouTube Music, pre-release / `dev` channel only — enable **Use pre-releases** in Morphe Manager to test)*
 
 ---
@@ -36,7 +38,7 @@ A standalone **Material 3 Expressive** navigation bar and miniplayer redesign ad
 2. Confirm adding the patch source when prompted (or add it manually in **Morphe Manager → Patch Sources → Add Source** by pasting `https://github.com/iAmGodKiller/M3-Redesign`).
 3. Keep the official **Morphe** patches source enabled alongside **M3-Redesign**.
 4. **For YouTube Music:** Select **M3 Redesign addon** with your usual YouTube Music patches, patch YouTube Music, then open **Settings → Morphe → M3 Redesign addon** and enable it.
-5. **For YouTube:** Select **Remove top black bar** and/or **Scroll away home toolbar** alongside your usual YouTube patches (including Morphe's **Hide status bar** if desired) and patch YouTube.
+5. **For YouTube:** Select any combination of **Remove top black bar**, **Scroll away home toolbar**, **Swap profile photo with Library icon**, and **Glass navigation bar blur** alongside your usual YouTube patches and patch YouTube.
 
 ### Method 2 — Manual `.mpp` File
 1. Download the latest `M3-Redesign-v*.mpp` from the **[Releases](https://github.com/iAmGodKiller/M3-Redesign/releases)** page.
@@ -99,7 +101,7 @@ M3-Redesign/
 ├── build-config/                             # Standalone Gradle & ProGuard overlays
 ├── extension/                                # Stable YouTube Music Java extension (M3NavigationFilter & M3NavigationPreference)
 ├── patch/                                    # Stable YouTube Music Kotlin Morphe patch & bytecode fingerprints
-├── youtube/                                  # Standalone YouTube patches & extension (Remove top black bar, Scroll away home toolbar)
+├── youtube/                                  # Standalone YouTube patches & extension (fullscreen, scrolling toolbar, Library icon, glass blur)
 ├── prerelease/                               # Pre-release patches & extensions (e.g. Transparent status bar)
 ├── scripts/
 │   ├── build-local.sh                        # One-command local build script (stable & pre-release)
