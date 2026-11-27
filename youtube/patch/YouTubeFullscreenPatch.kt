@@ -17,7 +17,6 @@ import app.morphe.patcher.patch.resourceXml
 import app.morphe.patcher.patch.resourceXmlOrNull
 import app.morphe.patcher.string
 import app.morphe.patcher.util.getReference
-import app.morphe.patcher.util.proxy.mutableTypes.MutableMethod
 import app.morphe.patcher.xml.XmlElement
 import app.morphe.patches.youtube.shared.Constants.COMPATIBILITY_YOUTUBE
 import com.android.tools.smali.dexlib2.AccessFlags
@@ -103,28 +102,35 @@ private object YtFullscreenStatusBarBackgroundShowFingerprint : Fingerprint(
     )
 )
 
-private object YtPivotBarCreateResourceStyledViewFingerprint : Fingerprint(
-    definingClass = PIVOT_BAR_CLASS,
-    accessFlags = listOf(AccessFlags.PUBLIC, AccessFlags.FINAL),
-    returnType = "Landroid/view/View;",
-    parameters = listOf("L", "Z", "I", "L")
+private object YtPivotBarConstructorFingerprint : Fingerprint(
+    accessFlags = listOf(AccessFlags.PUBLIC, AccessFlags.CONSTRUCTOR),
+    filters = listOf(
+        string("com.google.android.apps.youtube.app.endpoint.flags")
+    )
 )
 
-private object YtPivotBarCreateDrawableViewFingerprint : Fingerprint(
-    definingClass = PIVOT_BAR_CLASS,
+private object YtInitializeButtonsFingerprint : Fingerprint(
+    classFingerprint = YtPivotBarConstructorFingerprint,
     accessFlags = listOf(AccessFlags.PUBLIC, AccessFlags.FINAL),
-    returnType = "Landroid/view/View;",
-    custom = { method, _ ->
-        method.parameterTypes.firstOrNull()?.toString() == "Landroid/graphics/drawable/Drawable;"
-    }
+    returnType = "V",
+    filters = listOf(
+        string("FEvideo_picker")
+    )
 )
 
-private object YtPivotBarCreateResourceIntViewFingerprint : Fingerprint(
-    definingClass = PIVOT_BAR_CLASS,
-    accessFlags = listOf(AccessFlags.PUBLIC, AccessFlags.FINAL),
-    returnType = "Landroid/view/View;",
-    custom = { method, _ ->
-        method.parameterTypes.firstOrNull()?.toString() == "I"
+private object YtNavigationEnumFingerprint : Fingerprint(
+    accessFlags = listOf(AccessFlags.STATIC, AccessFlags.CONSTRUCTOR),
+    strings = listOf(
+        "PIVOT_HOME",
+        "TAB_SHORTS",
+        "CREATION_TAB_LARGE",
+        "PIVOT_SUBSCRIPTIONS",
+        "TAB_ACTIVITY",
+        "VIDEO_LIBRARY_WHITE",
+        "INCOGNITO_CIRCLE"
+    ),
+    custom = { _, classDef ->
+        !classDef.type.startsWith("Lapp/morphe")
     }
 )
 
@@ -311,13 +317,60 @@ val swapProfileWithLibraryPatch = patch(
             )
         }
 
-        listOf(
-            YtPivotBarCreateResourceStyledViewFingerprint,
-            YtPivotBarCreateDrawableViewFingerprint,
-            YtPivotBarCreateResourceIntViewFingerprint
-        ).forEach { fp ->
-            fp.clearMatch()
-            fp.matchOrNull()?.method?.hookReturnedPivotTabView()
+        // Track YouTube's navigation button enum inside InitializeButtons so ONLY the
+        // "You" (profile photo / library) tab is swapped, leaving Home/Shorts/Subscriptions/Create untouched.
+        YtNavigationEnumFingerprint.clearMatch()
+        val navigationEnumClassName = YtNavigationEnumFingerprint.matchOrNull()?.originalClassDef?.type
+
+        YtPivotBarConstructorFingerprint.clearMatch()
+        YtInitializeButtonsFingerprint.clearMatch()
+        if (navigationEnumClassName != null) {
+            YtInitializeButtonsFingerprint.matchOrNull()?.method?.apply {
+                val instrs = implementation?.instructions?.toList() ?: return@apply
+                for (i in instrs.indices.reversed()) {
+                    if (i + 1 >= instrs.size || instrs[i + 1].opcode != Opcode.MOVE_RESULT_OBJECT) {
+                        continue
+                    }
+                    val insn = instrs[i]
+                    val ref = (insn as? ReferenceInstruction)?.getReference<MethodReference>() ?: continue
+                    val resultReg = (instrs[i + 1] as OneRegisterInstruction).registerA
+
+                    if ((insn.opcode == Opcode.INVOKE_STATIC || insn.opcode == Opcode.INVOKE_STATIC_RANGE)
+                        && ref.definingClass == navigationEnumClassName
+                        && ref.returnType == navigationEnumClassName
+                    ) {
+                        addInstruction(
+                            i + 2,
+                            "invoke-static/range { v$resultReg .. v$resultReg }, " +
+                                "$EXTENSION_CLASS->onNavigationEnumLoaded(Ljava/lang/Enum;)V"
+                        )
+                    } else if ((insn.opcode == Opcode.INVOKE_VIRTUAL || insn.opcode == Opcode.INVOKE_VIRTUAL_RANGE)
+                        && ref.definingClass == PIVOT_BAR_CLASS
+                        && ref.returnType == "Landroid/view/View;"
+                    ) {
+                        val params = ref.parameterTypes
+                        val isImageResourceStyledTab = params.size == 4
+                            && params[1].toString() == "Z"
+                            && params[2].toString() == "I"
+                        val isStandardTab = params.firstOrNull()?.toString() == "Landroid/graphics/drawable/Drawable;"
+                            || params.firstOrNull()?.toString() == "I"
+
+                        if (isImageResourceStyledTab) {
+                            addInstruction(
+                                i + 2,
+                                "invoke-static/range { v$resultReg .. v$resultReg }, " +
+                                    "$EXTENSION_CLASS->onImageResourceTabLoaded(Landroid/view/View;)V"
+                            )
+                        } else if (isStandardTab) {
+                            addInstruction(
+                                i + 2,
+                                "invoke-static/range { v$resultReg .. v$resultReg }, " +
+                                    "$EXTENSION_CLASS->onNavigationTabLoaded(Landroid/view/View;)V"
+                            )
+                        }
+                    }
+                }
+            }
         }
 
         YtPivotBarSetSelectedFingerprint.clearMatch()
@@ -463,21 +516,6 @@ val glassNavBarBlurPatch = patch(
         val addOnFile = resourceFile(ADD_ON_PREFERENCES_FILE_PATH)
         if (injectedIntoPrefs && addOnFile.exists()) {
             addOnFile.delete()
-        }
-    }
-}
-
-private fun MutableMethod.hookReturnedPivotTabView() {
-    val instrs = implementation?.instructions?.toList() ?: return
-    for (i in instrs.indices.reversed()) {
-        val insn = instrs[i]
-        if (insn.opcode == Opcode.RETURN_OBJECT) {
-            val reg = (insn as OneRegisterInstruction).registerA
-            addInstruction(
-                i,
-                "invoke-static/range { v$reg .. v$reg }, " +
-                    "$EXTENSION_CLASS->onPivotTabCreated(Landroid/view/View;)V"
-            )
         }
     }
 }

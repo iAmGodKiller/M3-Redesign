@@ -9,6 +9,7 @@ import android.preference.Preference;
 import android.util.AttributeSet;
 import android.util.TypedValue;
 import android.view.Gravity;
+import android.widget.CheckBox;
 import android.widget.LinearLayout;
 import android.widget.SeekBar;
 import android.widget.TextView;
@@ -54,13 +55,16 @@ public class YouTubeGlassBlurPreference extends Preference {
             return;
         }
         int blurDp = YouTubeFullscreenFilter.getGlassBlurDp(ctx);
+        boolean hideShadow = YouTubeFullscreenFilter.isHideGlassShadow(ctx);
+        String blurPart;
         if (blurDp < 0) {
-            setSummary("App default");
+            blurPart = "App default";
         } else if (blurDp == 0) {
-            setSummary("0 dp (Off — clear glass)");
+            blurPart = "0 dp (Off — clear glass)";
         } else {
-            setSummary(blurDp + " dp");
+            blurPart = blurDp + " dp";
         }
+        setSummary(hideShadow ? (blurPart + " · Clean edge") : blurPart);
     }
 
     @Override
@@ -71,6 +75,7 @@ public class YouTubeGlassBlurPreference extends Preference {
         }
 
         final int savedDp = YouTubeFullscreenFilter.getGlassBlurDp(ctx);
+        final boolean savedHideShadow = YouTubeFullscreenFilter.isHideGlassShadow(ctx);
         final int initialSliderDp = savedDp >= 0
                 ? clamp(savedDp, 0, MAX_BLUR_DP)
                 : clamp(YouTubeFullscreenFilter.getDetectedDefaultBlurDp(ctx), 0, MAX_BLUR_DP);
@@ -111,6 +116,19 @@ public class YouTubeGlassBlurPreference extends Preference {
         hint.setText("0 dp disables blur for clear glass. Higher values increase frosted glass blur strength.");
         container.addView(hint);
 
+        final CheckBox hideShadowCheck = new CheckBox(ctx);
+        hideShadowCheck.setText("Hide capsule shadow & hair-like edge");
+        hideShadowCheck.setTextColor(primaryTextColor);
+        hideShadowCheck.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f);
+        hideShadowCheck.setChecked(savedHideShadow);
+        LinearLayout.LayoutParams cbLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+        );
+        cbLp.topMargin = Math.round(14f * density);
+        hideShadowCheck.setLayoutParams(cbLp);
+        container.addView(hideShadowCheck);
+
         final boolean[] userMovedSlider = {savedDp >= 0};
         seekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
@@ -137,15 +155,16 @@ public class YouTubeGlassBlurPreference extends Preference {
             builder.setPositiveButton("Apply", new DialogInterface.OnClickListener() {
                 @Override
                 public void onClick(DialogInterface dialog, int which) {
-                    int chosen = seekBar.getProgress();
-                    YouTubeFullscreenFilter.setGlassBlurDp(ctx, chosen);
+                    int chosenBlur = userMovedSlider[0] ? seekBar.getProgress() : savedDp;
+                    boolean hideShadow = hideShadowCheck.isChecked();
+                    YouTubeFullscreenFilter.setGlassAppearance(ctx, chosenBlur, hideShadow);
                     updateSummary();
                 }
             });
             builder.setNeutralButton("Reset", new DialogInterface.OnClickListener() {
                 @Override
                 public void onClick(DialogInterface dialog, int which) {
-                    YouTubeFullscreenFilter.setGlassBlurDp(ctx, -1);
+                    YouTubeFullscreenFilter.setGlassAppearance(ctx, -1, false);
                     updateSummary();
                 }
             });

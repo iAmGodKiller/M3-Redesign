@@ -9,6 +9,7 @@ import android.content.res.Resources;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Insets;
+import android.graphics.LinearGradient;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.Rect;
@@ -16,8 +17,11 @@ import android.graphics.RectF;
 import android.graphics.RenderEffect;
 import android.graphics.RenderNode;
 import android.graphics.Shader;
+import android.graphics.drawable.Drawable;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.DisplayCutout;
 import android.view.Gravity;
 import android.view.View;
@@ -52,7 +56,11 @@ public final class YouTubeFullscreenFilter {
 
     private static final String PREFS_NAME = "morphe_yt_addon_prefs";
     private static final String KEY_GLASS_BLUR_DP = "glass_nav_blur_dp";
+    private static final String KEY_HIDE_GLASS_SHADOW = "glass_nav_hide_shadow";
     private static final String LIBRARY_ICON_TAG = "morphe_yt_library_icon_view";
+    private static final String GLASS_CAPSULE_CLASS_SUFFIX = "GlassCapsuleDrawable";
+    private static volatile Shader transparentShader = null;
+    private static final Handler MAIN_HANDLER = new Handler(Looper.getMainLooper());
 
     private static final int SCROLL_FLAG_SCROLL = 0x1;
     private static final long APPBAR_UPDATE_DEBOUNCE_MS = 60L;
@@ -122,14 +130,24 @@ public final class YouTubeFullscreenFilter {
     private static volatile boolean lifecycleRegistered = false;
     private static volatile WeakReference<Activity> currentActivityRef = new WeakReference<>(null);
 
-    // Glass navigation bar blur state (fast O(1) volatile check during draw).
+    // Glass navigation bar blur + clean edge state (fast O(1) volatile check during draw).
     private static volatile int savedGlassBlurDp = -1; // -1 = App default, 0 = Off, 1..60 = custom dp
+    private static volatile boolean savedHideGlassShadow = true;
     private static volatile boolean glassBlurPrefLoaded = false;
     private static volatile int glassBlurRevision = 0;
     private static volatile float appDensity = 2.0f;
     private static volatile float detectedDefaultBlurPx = -1f;
     private static WeakReference<Object> lastFrostedDrawableRef = new WeakReference<>(null);
     private static int lastFrostedDrawableRevision = -1;
+    private static WeakReference<Drawable> lastGlassCapsuleRef = new WeakReference<>(null);
+    private static WeakReference<Drawable> savedGlassAppBgRef = new WeakReference<>(null);
+    private static final HashMap<Class<?>, GlassCapsuleFields> GLASS_CAPSULE_CACHE = new HashMap<>();
+    private static final GlassCapsuleFields NO_GLASS_FIELDS = new GlassCapsuleFields(null, null, null, null, null, null);
+    private static final HashMap<Class<?>, Field> CALLBACK_OUTER_FIELD_CACHE = new HashMap<>();
+
+    // Navigation button enum tracking so ONLY the "You" (profile photo) tab is swapped.
+    private static volatile String lastNavigationEnumName = null;
+    private static final WeakHashMap<View, Boolean> YOU_TAB_VIEWS = new WeakHashMap<>();
 
     // Process-wide cached resource IDs (resolved once, never during scroll).
     private static volatile boolean idsResolved = false;
@@ -268,6 +286,11 @@ public final class YouTubeFullscreenFilter {
         return savedGlassBlurDp;
     }
 
+    public static boolean isHideGlassShadow(Context context) {
+        ensureGlassBlurPrefLoaded(context);
+        return savedHideGlassShadow;
+    }
+
     public static int getDetectedDefaultBlurDp(Context context) {
         float d = appDensity;
         if (context != null && context.getResources() != null) {
@@ -281,8 +304,13 @@ public final class YouTubeFullscreenFilter {
     }
 
     public static void setGlassBlurDp(Context context, int blurDp) {
+        setGlassAppearance(context, blurDp, savedHideGlassShadow);
+    }
+
+    public static void setGlassAppearance(Context context, int blurDp, boolean hideShadow) {
         int normalized = blurDp < 0 ? -1 : Math.max(0, Math.min(60, blurDp));
         savedGlassBlurDp = normalized;
+        savedHideGlassShadow = hideShadow;
         glassBlurPrefLoaded = true;
         glassBlurRevision++;
         if (context != null) {
@@ -292,10 +320,32 @@ public final class YouTubeFullscreenFilter {
                 }
                 SharedPreferences prefs = context.getApplicationContext()
                         .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-                prefs.edit().putInt(KEY_GLASS_BLUR_DP, normalized).apply();
+                prefs.edit()
+                        .putInt(KEY_GLASS_BLUR_DP, normalized)
+                        .putBoolean(KEY_HIDE_GLASS_SHADOW, hideShadow)
+                        .apply();
             } catch (Throwable ignored) {
             }
         }
+        // Apply immediately live on the main thread without requiring an app restart.
+        MAIN_HANDLER.post(new Runnable() {
+            @Override
+            public void run() {
+                Drawable glass = lastGlassCapsuleRef.get();
+                if (glass != null) {
+                    syncGlassCapsuleAppearance(glass, null);
+                }
+                Activity act = currentActivityRef.get();
+                if (act != null && !act.isFinishing() && !act.isDestroyed()) {
+                    Window w = act.getWindow();
+                    View decor = w != null ? w.getDecorView() : null;
+                    ActivityState st = getState(act);
+                    if (decor != null && st != null) {
+                        syncGlassCapsuleFromDecor(decor, st);
+                    }
+                }
+            }
+        });
     }
 
     private static void ensureGlassBlurPrefLoaded(Context context) {
@@ -309,6 +359,7 @@ public final class YouTubeFullscreenFilter {
             SharedPreferences prefs = context.getApplicationContext()
                     .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
             savedGlassBlurDp = prefs.getInt(KEY_GLASS_BLUR_DP, -1);
+            savedHideGlassShadow = prefs.getBoolean(KEY_HIDE_GLASS_SHADOW, true);
             glassBlurPrefLoaded = true;
         } catch (Throwable ignored) {
         }
@@ -344,7 +395,8 @@ public final class YouTubeFullscreenFilter {
     /**
      * Hooked at index 0 of draw(Canvas) on YouTube's "frostedGlassRenderNode" drawable.
      * Fast path is a single reference + int comparison (~1 ns) so scrolling has zero overhead;
-     * when the user changes the blur slider in Settings, updates RenderNode.setRenderEffect live.
+     * when the user changes blur/shadow in Settings (or on initial draw), updates RenderNode
+     * and Morphe's GlassCapsuleDrawable live.
      */
     public static void onFrostedGlassDraw(Object drawable) {
         if (!glassBlurEnabled || drawable == null || Build.VERSION.SDK_INT < 31) {
@@ -357,7 +409,25 @@ public final class YouTubeFullscreenFilter {
         lastFrostedDrawableRef = new WeakReference<>(drawable);
         lastFrostedDrawableRevision = rev;
 
-        int blurDp = savedGlassBlurDp;
+        final int blurDp = savedGlassBlurDp;
+
+        // Discover parent GlassCapsuleDrawable from Drawable.getCallback() (zero view traversal).
+        if (drawable instanceof Drawable) {
+            final Drawable appBgDrawable = (Drawable) drawable;
+            savedGlassAppBgRef = new WeakReference<>(appBgDrawable);
+            final Drawable glassCapsule = resolveParentGlassCapsule(appBgDrawable);
+            if (glassCapsule != null) {
+                lastGlassCapsuleRef = new WeakReference<>(glassCapsule);
+                // Post outside draw() so we never mutate appBackground or invalidate synchronously mid-draw.
+                MAIN_HANDLER.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        syncGlassCapsuleAppearance(glassCapsule, appBgDrawable);
+                    }
+                });
+            }
+        }
+
         // On initial revision 0 with App default (-1), keep YouTube's native RenderEffect untouched.
         if (rev == 0 && blurDp < 0) {
             return;
@@ -385,6 +455,238 @@ public final class YouTubeFullscreenFilter {
                 node.setRenderEffect(RenderEffect.createBlurEffect(px, px, Shader.TileMode.CLAMP));
             }
         } catch (Throwable ignored) {
+        }
+    }
+
+    private static Drawable resolveParentGlassCapsule(Drawable appBg) {
+        if (appBg == null) {
+            return null;
+        }
+        try {
+            Drawable.Callback cb = appBg.getCallback();
+            if (cb == null) {
+                return null;
+            }
+            if (cb instanceof Drawable && cb.getClass().getName().endsWith(GLASS_CAPSULE_CLASS_SUFFIX)) {
+                return (Drawable) cb;
+            }
+            Field outerField = getCachedCallbackOuterField(cb.getClass());
+            if (outerField != null) {
+                Object outer = outerField.get(cb);
+                if (outer instanceof Drawable && outer.getClass().getName().endsWith(GLASS_CAPSULE_CLASS_SUFFIX)) {
+                    return (Drawable) outer;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    private static Field getCachedCallbackOuterField(Class<?> cbClass) {
+        synchronized (CALLBACK_OUTER_FIELD_CACHE) {
+            Field cached = CALLBACK_OUTER_FIELD_CACHE.get(cbClass);
+            if (cached != null) {
+                return cached == NO_FIELD ? null : cached;
+            }
+        }
+        Field resolved = null;
+        try {
+            Field[] fields = cbClass.getDeclaredFields();
+            for (int i = 0; i < fields.length; i++) {
+                Field f = fields[i];
+                if (f.getType().getName().endsWith(GLASS_CAPSULE_CLASS_SUFFIX)) {
+                    f.setAccessible(true);
+                    resolved = f;
+                    break;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        synchronized (CALLBACK_OUTER_FIELD_CACHE) {
+            CALLBACK_OUTER_FIELD_CACHE.put(cbClass, resolved != null ? resolved : NO_FIELD);
+        }
+        return resolved;
+    }
+
+    private static void syncGlassCapsuleFromDecor(View decor, ActivityState state) {
+        if (!glassBlurEnabled || decor == null) {
+            return;
+        }
+        ViewGroup navBar = findNavBarFast(decor, state);
+        if (navBar == null) {
+            return;
+        }
+        Drawable bg = navBar.getBackground();
+        if (bg != null && bg.getClass().getName().endsWith(GLASS_CAPSULE_CLASS_SUFFIX)) {
+            lastGlassCapsuleRef = new WeakReference<>(bg);
+            syncGlassCapsuleAppearance(bg, null);
+        }
+    }
+
+    /**
+     * Removes the stacked unblurred dark shadow layers around Morphe's GlassCapsuleDrawable
+     * and cleanly detaches/reattaches YouTube's frostedGlassRenderNode appBackground when blur is 0 dp
+     * so the capsule renders with pure hardware anti-aliased drawRoundRect (zero clipPath curved seam).
+     */
+    private static void syncGlassCapsuleAppearance(Drawable glassCapsule, Drawable knownAppBg) {
+        if (!glassBlurEnabled || glassCapsule == null) {
+            return;
+        }
+        GlassCapsuleFields fields = getCachedGlassCapsuleFields(glassCapsule.getClass());
+        if (fields == null) {
+            return;
+        }
+        boolean changed = false;
+        try {
+            Shader clearShader = savedHideGlassShadow ? getTransparentShader() : null;
+
+            // 1. Silence or restore the 3 unblurred stacked black shadow roundRects on left/right/bottom
+            //    via a transparent Shader (leaves shadowAlpha intact so toggling off restores immediately).
+            if (fields.shadowPaintField != null) {
+                Object rawShadow = fields.shadowPaintField.get(glassCapsule);
+                if (rawShadow instanceof Paint) {
+                    Paint shadowPaint = (Paint) rawShadow;
+                    if (shadowPaint.getShader() != clearShader) {
+                        shadowPaint.setShader(clearShader);
+                        changed = true;
+                    }
+                }
+            }
+
+            // 2. If official edge/rim is disabled (rimScale <= 0), ensure bevelPaint cannot draw a stray dark line.
+            if (fields.bevelPaintField != null && fields.rimScaleField != null) {
+                float rimScale = fields.rimScaleField.getFloat(glassCapsule);
+                Object rawBevel = fields.bevelPaintField.get(glassCapsule);
+                if (rawBevel instanceof Paint) {
+                    Paint bevelPaint = (Paint) rawBevel;
+                    Shader targetBevel = (savedHideGlassShadow && rimScale <= 0f) ? clearShader : null;
+                    if (bevelPaint.getShader() != targetBevel) {
+                        bevelPaint.setShader(targetBevel);
+                        changed = true;
+                    }
+                }
+            }
+
+            // 3. When blur == 0 dp, detach appBackground so GlassCapsuleDrawable skips
+            //    canvas.clipPath(capsulePath) + drawRenderNode (which creates a 1px curved hairline seam)
+            //    and renders via pure anti-aliased drawRoundRect; reattach seamlessly when blur != 0 dp.
+            if (fields.appBackgroundField != null && fields.setAppBackgroundMethod != null) {
+                Drawable currentAppBg = (Drawable) fields.appBackgroundField.get(glassCapsule);
+                if (currentAppBg != null) {
+                    savedGlassAppBgRef = new WeakReference<>(currentAppBg);
+                } else if (knownAppBg != null) {
+                    savedGlassAppBgRef = new WeakReference<>(knownAppBg);
+                }
+
+                if (savedGlassBlurDp == 0) {
+                    if (currentAppBg != null) {
+                        fields.setAppBackgroundMethod.invoke(glassCapsule, new Object[]{null});
+                        changed = true;
+                    }
+                } else {
+                    Drawable restoreBg = savedGlassAppBgRef.get();
+                    if (currentAppBg == null && restoreBg != null) {
+                        fields.setAppBackgroundMethod.invoke(glassCapsule, restoreBg);
+                        changed = true;
+                    }
+                }
+            }
+
+            if (changed) {
+                glassCapsule.invalidateSelf();
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static GlassCapsuleFields getCachedGlassCapsuleFields(Class<?> cls) {
+        synchronized (GLASS_CAPSULE_CACHE) {
+            GlassCapsuleFields cached = GLASS_CAPSULE_CACHE.get(cls);
+            if (cached != null) {
+                return cached == NO_GLASS_FIELDS ? null : cached;
+            }
+        }
+        Field shadowPaintField = null;
+        Field shadowAlphaField = null;
+        Field appBackgroundField = null;
+        Field bevelPaintField = null;
+        Field rimScaleField = null;
+        Method setAppBackgroundMethod = null;
+        try {
+            shadowPaintField = findDeclaredField(cls, "shadowPaint");
+            shadowAlphaField = findDeclaredField(cls, "shadowAlpha");
+            appBackgroundField = findDeclaredField(cls, "appBackground");
+            bevelPaintField = findDeclaredField(cls, "bevelPaint");
+            rimScaleField = findDeclaredField(cls, "rimScale");
+            try {
+                setAppBackgroundMethod = cls.getMethod("setAppBackground", Drawable.class);
+                setAppBackgroundMethod.setAccessible(true);
+            } catch (Throwable ignored) {
+            }
+        } catch (Throwable ignored) {
+        }
+        GlassCapsuleFields resolved = (shadowPaintField != null || appBackgroundField != null)
+                ? new GlassCapsuleFields(
+                        shadowPaintField,
+                        shadowAlphaField,
+                        appBackgroundField,
+                        bevelPaintField,
+                        rimScaleField,
+                        setAppBackgroundMethod)
+                : NO_GLASS_FIELDS;
+        synchronized (GLASS_CAPSULE_CACHE) {
+            GLASS_CAPSULE_CACHE.put(cls, resolved);
+        }
+        return resolved == NO_GLASS_FIELDS ? null : resolved;
+    }
+
+    private static Shader getTransparentShader() {
+        Shader s = transparentShader;
+        if (s == null) {
+            s = new LinearGradient(0f, 0f, 1f, 1f, Color.TRANSPARENT, Color.TRANSPARENT, Shader.TileMode.CLAMP);
+            transparentShader = s;
+        }
+        return s;
+    }
+
+    private static Field findDeclaredField(Class<?> cls, String name) {
+        Class<?> c = cls;
+        while (c != null && c != Object.class) {
+            try {
+                Field f = c.getDeclaredField(name);
+                f.setAccessible(true);
+                return f;
+            } catch (NoSuchFieldException ignored) {
+                c = c.getSuperclass();
+            } catch (Throwable ignored) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    private static final class GlassCapsuleFields {
+        final Field shadowPaintField;
+        final Field shadowAlphaField;
+        final Field appBackgroundField;
+        final Field bevelPaintField;
+        final Field rimScaleField;
+        final Method setAppBackgroundMethod;
+
+        GlassCapsuleFields(
+                Field shadowPaintField,
+                Field shadowAlphaField,
+                Field appBackgroundField,
+                Field bevelPaintField,
+                Field rimScaleField,
+                Method setAppBackgroundMethod
+        ) {
+            this.shadowPaintField = shadowPaintField;
+            this.shadowAlphaField = shadowAlphaField;
+            this.appBackgroundField = appBackgroundField;
+            this.bevelPaintField = bevelPaintField;
+            this.rimScaleField = rimScaleField;
+            this.setAppBackgroundMethod = setAppBackgroundMethod;
         }
     }
 
@@ -428,36 +730,100 @@ public final class YouTubeFullscreenFilter {
     // -------------------------------------------------------------------------
 
     /**
-     * Hooked right before RETURN_OBJECT of PivotBar button creation methods.
+     * Hooked right after YouTube resolves the navigation button enum inside InitializeButtons.
+     * Every non-"You" tab (Home, Shorts, Create, Subscriptions, Notifications, etc.) sets an enum
+     * right before creating its PivotBar tab view; the modern "You" profile photo tab does not.
      */
-    public static void onPivotTabCreated(final View tabView) {
-        if (!swapProfileWithLibraryEnabled || tabView == null) {
+    public static void onNavigationEnumLoaded(Enum<?> ytNavigationEnum) {
+        if (!swapProfileWithLibraryEnabled) {
             return;
         }
         try {
-            Context ctx = tabView.getContext();
-            if (ctx != null) {
-                resolveResourceIdsOnce(ctx.getResources(), ctx.getPackageName());
-            }
-            if (swapYouTabToLibraryIcon(tabView)) {
-                // Run once more after current message loop in case YouTube binds avatar views
-                // immediately after returning the newly inflated tab view.
-                tabView.post(new Runnable() {
-                    @Override
-                    public void run() {
-                        swapYouTabToLibraryIcon(tabView);
-                    }
-                });
+            if (ytNavigationEnum != null) {
+                lastNavigationEnumName = ytNavigationEnum.name();
             }
         } catch (Throwable ignored) {
         }
     }
 
     /**
+     * Hooked right after PivotBar creates an image-resource-styled tab view inside InitializeButtons.
+     * On YouTube 21.43+ this is called for all tabs; ONLY the modern "You" profile photo tab
+     * arrives with lastNavigationEnumName == null (or a You/Account/Library enum).
+     */
+    public static void onImageResourceTabLoaded(final View tabView) {
+        if (!swapProfileWithLibraryEnabled || tabView == null) {
+            lastNavigationEnumName = null;
+            return;
+        }
+        try {
+            String enumName = lastNavigationEnumName;
+            lastNavigationEnumName = null;
+            if (enumName == null || isYouProfileTabEnum(enumName)) {
+                registerAndSwapYouTab(tabView);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * Hooked right after PivotBar creates a drawable or int-resource tab view inside InitializeButtons.
+     * Consumes lastNavigationEnumName so it never leaks into the following tab, and swaps only if
+     * the enum explicitly identifies the You/Account/Library tab.
+     */
+    public static void onNavigationTabLoaded(final View tabView) {
+        if (!swapProfileWithLibraryEnabled || tabView == null) {
+            lastNavigationEnumName = null;
+            return;
+        }
+        try {
+            String enumName = lastNavigationEnumName;
+            lastNavigationEnumName = null;
+            if (isYouProfileTabEnum(enumName)) {
+                registerAndSwapYouTab(tabView);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static boolean isYouProfileTabEnum(String enumName) {
+        if (enumName == null) {
+            return false;
+        }
+        return "ACCOUNT_CIRCLE".equals(enumName)
+                || "ACCOUNT_CIRCLE_CAIRO".equals(enumName)
+                || "PIVOT_LIBRARY".equals(enumName)
+                || "VIDEO_LIBRARY_WHITE".equals(enumName);
+    }
+
+    private static void registerAndSwapYouTab(final View tabView) {
+        YOU_TAB_VIEWS.put(tabView, Boolean.TRUE);
+        Context ctx = tabView.getContext();
+        if (ctx != null) {
+            resolveResourceIdsOnce(ctx.getResources(), ctx.getPackageName());
+        }
+        swapYouTabToLibraryIcon(tabView);
+        // Run once more after current message loop in case YouTube binds avatar children
+        // immediately after returning the newly inflated tab view.
+        tabView.post(new Runnable() {
+            @Override
+            public void run() {
+                if (Boolean.TRUE.equals(YOU_TAB_VIEWS.get(tabView))) {
+                    swapYouTabToLibraryIcon(tabView);
+                }
+            }
+        });
+    }
+
+    /**
      * Hooked right after setSelected(boolean) inside PivotBar.
+     * Strictly gated to verified You tab views so other tabs are never touched.
      */
     public static void onPivotTabSelected(View tabView, boolean isSelected) {
         if (!swapProfileWithLibraryEnabled || tabView == null) {
+            return;
+        }
+        if (!Boolean.TRUE.equals(YOU_TAB_VIEWS.get(tabView))) {
             return;
         }
         try {
@@ -475,30 +841,47 @@ public final class YouTubeFullscreenFilter {
     }
 
     private static void scanNavBarForYouTab(View decor, ActivityState state) {
-        if (!swapProfileWithLibraryEnabled || decor == null) {
+        if (!swapProfileWithLibraryEnabled || decor == null || YOU_TAB_VIEWS.isEmpty()) {
             return;
         }
-        ViewGroup navBar = findNavBarFast(decor, state);
-        if (navBar == null) {
-            return;
-        }
-        ViewGroup tabsContainer = unwrapTabsContainer(navBar);
-        int count = tabsContainer.getChildCount();
-        for (int i = 0; i < count; i++) {
-            View tab = tabsContainer.getChildAt(i);
-            if (tab != null) {
-                swapYouTabToLibraryIcon(tab);
+        try {
+            // Refresh ONLY already-verified You tab views (never blindly scan all nav bar tabs).
+            for (View tab : YOU_TAB_VIEWS.keySet()) {
+                if (tab != null && tab.isAttachedToWindow()) {
+                    swapYouTabToLibraryIcon(tab);
+                }
             }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void hideOriginalAvatarChild(View child, boolean isLinear) {
+        if (child == null || (child instanceof LibraryIconView && LIBRARY_ICON_TAG.equals(child.getTag()))) {
+            return;
+        }
+        // Keep original avatar/ring children hidden even if Glide reloads the bitmap asynchronously.
+        if (child.getAlpha() != 0f) {
+            child.setAlpha(0f);
+        }
+        if (child.getScaleX() != 0f) {
+            child.setScaleX(0f);
+        }
+        if (child.getScaleY() != 0f) {
+            child.setScaleY(0f);
+        }
+        int hiddenVis = isLinear ? View.GONE : View.INVISIBLE;
+        if (child.getVisibility() != hiddenVis) {
+            child.setVisibility(hiddenVis);
         }
     }
 
     private static boolean swapYouTabToLibraryIcon(View tabView) {
-        ViewGroup avatarContainer = findYouTabAvatarContainer(tabView);
+        final ViewGroup avatarContainer = findYouTabAvatarContainer(tabView);
         if (avatarContainer == null) {
             return false;
         }
 
-        boolean isLinear = avatarContainer instanceof LinearLayout;
+        final boolean isLinear = avatarContainer instanceof LinearLayout;
         int origW = 0;
         int origH = 0;
         LibraryIconView existingIcon = null;
@@ -522,20 +905,7 @@ public final class YouTubeFullscreenFilter {
                     origH = clp.height;
                 }
             }
-            // Keep original avatar/ring children hidden even if Glide reloads the bitmap asynchronously.
-            if (child.getAlpha() != 0f) {
-                child.setAlpha(0f);
-            }
-            if (child.getScaleX() != 0f) {
-                child.setScaleX(0f);
-            }
-            if (child.getScaleY() != 0f) {
-                child.setScaleY(0f);
-            }
-            int hiddenVis = isLinear ? View.GONE : View.INVISIBLE;
-            if (child.getVisibility() != hiddenVis) {
-                child.setVisibility(hiddenVis);
-            }
+            hideOriginalAvatarChild(child, isLinear);
         }
 
         TextView labelView = null;
@@ -568,6 +938,18 @@ public final class YouTubeFullscreenFilter {
                 iconLp = new ViewGroup.LayoutParams(targetW, targetH);
             }
             avatarContainer.addView(iconView, iconLp);
+
+            // Guard against YouTube dynamically adding a late avatar child inside this You tab container.
+            avatarContainer.setOnHierarchyChangeListener(new ViewGroup.OnHierarchyChangeListener() {
+                @Override
+                public void onChildViewAdded(View parent, View child) {
+                    hideOriginalAvatarChild(child, isLinear);
+                }
+
+                @Override
+                public void onChildViewRemoved(View parent, View child) {
+                }
+            });
         } else {
             existingIcon.updateLabelRef(labelView);
             existingIcon.setTabSelected(tabView.isSelected());
@@ -1067,6 +1449,10 @@ public final class YouTubeFullscreenFilter {
 
         if (swapProfileWithLibraryEnabled && decor != null) {
             scanNavBarForYouTab(decor, state);
+        }
+
+        if (glassBlurEnabled && decor != null) {
+            syncGlassCapsuleFromDecor(decor, state);
         }
 
         if (homeScrollToolbarEnabled) {
