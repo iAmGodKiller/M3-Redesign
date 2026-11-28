@@ -26,7 +26,8 @@ tasks.withType<JavaCompile>().configureEach {
             .filter { it.isFile && it.extension == "class" }
             .filter {
                 !it.name.startsWith("YouTubeFullscreenFilter") &&
-                    !it.name.startsWith("YouTubeGlassBlurPreference")
+                    !it.name.startsWith("YouTubeGlassBlurPreference") &&
+                    !it.name.startsWith("YouTubeTabletWatchLayout")
             }
             .forEach { it.delete() }
     }

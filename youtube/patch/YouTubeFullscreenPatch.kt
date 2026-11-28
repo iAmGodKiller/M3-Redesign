@@ -33,6 +33,9 @@ import com.android.tools.smali.dexlib2.iface.reference.MethodReference
 private const val EXTENSION_CLASS =
     "Lapp/morphe/extension/youtube/patches/fullscreen/YouTubeFullscreenFilter;"
 
+private const val TABLET_WATCH_EXTENSION_CLASS =
+    "Lapp/morphe/extension/youtube/patches/fullscreen/YouTubeTabletWatchLayout;"
+
 private const val ADD_ON_PREFERENCES_FILE_PATH = "morphe_addon_prefs.xml"
 
 private const val GLASS_BLUR_PREFERENCE_TAG =
@@ -518,6 +521,27 @@ val transparentStatusBarYouTubePatch = patch(
                         "$EXTENSION_CLASS->makeStatusBarBackgroundTransparent(Landroid/view/View;)V"
                 )
             }
+        }
+    }
+}
+
+@Suppress("unused")
+val tabletLandscapeWatchLayoutPatch = patch(
+    name = "Tablet landscape watch layout",
+    description = "In tablet landscape mode only, merges the channel row, subscribe/bell button, action buttons, and a new Comment button into one horizontally scrollable row under the video title, keeps comments open by default below it, and scrolls the entire column from title to comments together.",
+    default = false
+) {
+    compatibleWith(COMPATIBILITY_YOUTUBE_ANY)
+    extendWith("extensions/ytfullscreen.mpe")
+
+    finalize {
+        YtFullscreenMainActivityOnCreateFingerprint.let {
+            it.clearMatch()
+            it.method.addInstruction(
+                0,
+                "invoke-static/range { p0 .. p0 }, " +
+                    "$TABLET_WATCH_EXTENSION_CLASS->onTabletWatchLayoutEnabled(Landroid/app/Activity;)V"
+            )
         }
     }
 }
