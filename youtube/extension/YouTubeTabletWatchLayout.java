@@ -31,6 +31,7 @@ import android.view.ViewParent;
 import android.view.ViewTreeObserver;
 import android.view.Window;
 import android.view.WindowInsets;
+import android.view.accessibility.AccessibilityNodeInfo;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
@@ -124,9 +125,11 @@ public final class YouTubeTabletWatchLayout {
         boolean wrapperHiddenByUs = false;
         int wrapperPrevVisibility = View.VISIBLE;
 
+        boolean activityResumed = false;
         Runnable syncRunnable;
         Runnable retryCommentsRunnable;
         Runnable headerRefreshRunnable;
+        Runnable watchPollRunnable;
     }
 
     private YouTubeTabletWatchLayout() {
@@ -173,6 +176,8 @@ public final class YouTubeTabletWatchLayout {
                 public void onActivityStarted(Activity act) {
                     if (isTargetActivity(act)) {
                         currentActivityRef = new WeakReference<>(act);
+                        WatchState st = getState(act);
+                        st.activityResumed = true;
                         attachAndSchedule(act);
                     }
                 }
@@ -181,16 +186,38 @@ public final class YouTubeTabletWatchLayout {
                 public void onActivityResumed(Activity act) {
                     if (isTargetActivity(act)) {
                         currentActivityRef = new WeakReference<>(act);
+                        WatchState st = getState(act);
+                        st.activityResumed = true;
                         attachAndSchedule(act);
                     }
                 }
 
                 @Override
                 public void onActivityPaused(Activity act) {
+                    if (isTargetActivity(act)) {
+                        WatchState st;
+                        synchronized (STATES) {
+                            st = STATES.get(act);
+                        }
+                        if (st != null) {
+                            st.activityResumed = false;
+                            stopWatchPolling(st);
+                        }
+                    }
                 }
 
                 @Override
                 public void onActivityStopped(Activity act) {
+                    if (isTargetActivity(act)) {
+                        WatchState st;
+                        synchronized (STATES) {
+                            st = STATES.get(act);
+                        }
+                        if (st != null) {
+                            st.activityResumed = false;
+                            stopWatchPolling(st);
+                        }
+                    }
                 }
 
                 @Override
@@ -240,7 +267,10 @@ public final class YouTubeTabletWatchLayout {
         }
         final WatchState state = getState(activity);
         installDecorListeners(activity, decor, state);
-        scheduleSync(activity, state, 160L);
+        if (isTabletLandscape(activity)) {
+            startWatchPolling(activity, state);
+            scheduleSync(activity, state, 160L);
+        }
     }
 
     private static void installDecorListeners(Activity activity, final View decor, final WatchState state) {
@@ -260,10 +290,14 @@ public final class YouTubeTabletWatchLayout {
                     return;
                 }
                 if (!isTabletLandscape(act)) {
+                    stopWatchPolling(state);
                     teardownWatchOverlay(state);
                     return;
                 }
-                if (isImeOrDialogActive(act, v)) {
+                if (state.activityResumed) {
+                    startWatchPolling(act, state);
+                }
+                if (state.hostView != null && isImeOrDialogActive(act, v)) {
                     return;
                 }
                 scheduleSync(act, state, 140L);
@@ -283,12 +317,49 @@ public final class YouTubeTabletWatchLayout {
                     if (act == null || act.isFinishing() || act.isDestroyed()) {
                         return;
                     }
-                    scheduleSync(act, state, 140L);
+                    if (isTabletLandscape(act) && state.activityResumed) {
+                        startWatchPolling(act, state);
+                        scheduleSync(act, state, 140L);
+                    }
                 }
             };
             vto.addOnWindowFocusChangeListener(state.focusListener);
         }
         state.listenersInstalled = true;
+    }
+
+    private static void startWatchPolling(Activity activity, final WatchState state) {
+        if (state == null || state.watchPollRunnable != null || !enabled || !state.activityResumed) {
+            return;
+        }
+        final WeakReference<Activity> actRef = new WeakReference<>(activity);
+        state.watchPollRunnable = new Runnable() {
+            @Override
+            public void run() {
+                Activity act = actRef.get();
+                if (!enabled || act == null || act.isFinishing() || act.isDestroyed() || !state.activityResumed) {
+                    state.watchPollRunnable = null;
+                    return;
+                }
+                if (!isTabletLandscape(act)) {
+                    teardownWatchOverlay(state);
+                    state.watchPollRunnable = null;
+                    return;
+                }
+                syncTabletWatchLayout(act, state);
+                if (state.watchPollRunnable == this && state.activityResumed) {
+                    MAIN_HANDLER.postDelayed(this, state.hostView != null ? 900L : 650L);
+                }
+            }
+        };
+        MAIN_HANDLER.postDelayed(state.watchPollRunnable, 550L);
+    }
+
+    private static void stopWatchPolling(WatchState state) {
+        if (state != null && state.watchPollRunnable != null) {
+            MAIN_HANDLER.removeCallbacks(state.watchPollRunnable);
+            state.watchPollRunnable = null;
+        }
     }
 
     private static void detachActivity(Activity activity) {
@@ -302,6 +373,8 @@ public final class YouTubeTabletWatchLayout {
         if (state == null) {
             return;
         }
+        state.activityResumed = false;
+        stopWatchPolling(state);
         cancelCallbacks(state);
         teardownWatchOverlay(state);
         try {
@@ -408,8 +481,8 @@ public final class YouTubeTabletWatchLayout {
             return;
         }
         FrameLayout contentRoot = (FrameLayout) rawContent;
-        // Never tear down or mutate layout while user is typing in the comment composer / soft keyboard or viewing a modal dialog.
-        if (isImeOrDialogActive(activity, contentRoot)) {
+        // Never tear down an active overlay while user is typing in the comment composer / soft keyboard or viewing a modal dialog.
+        if (state.hostView != null && isImeOrDialogActive(activity, contentRoot)) {
             return;
         }
         int screenW = contentRoot.getWidth();
@@ -420,7 +493,7 @@ public final class YouTubeTabletWatchLayout {
         Resources res = activity.getResources();
 
         // 1. Collect all visible RecyclerViews outside our host to locate leftWatchRv & right-column Related Videos.
-        ArrayList<ViewGroup> allRvs = new ArrayList<>(8);
+        ArrayList<ViewGroup> allRvs = new ArrayList<>(10);
         collectVisibleRecyclerViews(contentRoot, 0, allRvs);
 
         ViewGroup leftWatchRv = findLeftWatchRecyclerView(allRvs, screenW, screenH, res);
@@ -439,7 +512,7 @@ public final class YouTubeTabletWatchLayout {
             }
             rv.getLocationInWindow(loc);
             if (loc[0] >= (int) (screenW * 0.48f) && rv.getWidth() >= (int) (screenW * 0.18f)
-                    && rv.getHeight() >= (int) (screenH * 0.40f)) {
+                    && rv.getHeight() >= (int) (screenH * 0.35f)) {
                 hasRightColumn = true;
                 if (!hasValidDockedComments(state)
                         && (SystemClock.uptimeMillis() - state.lastCommentsAutoClickMs) > 4000L) {
@@ -453,9 +526,9 @@ public final class YouTubeTabletWatchLayout {
             return;
         }
 
-        // 2. Semantically identify Title, Channel, Actions scroller, and verified Comments teaser inside leftWatchRv.
+        // 2. Semantically identify Title, Channel, Actions row/scroller, and verified Comments teaser inside leftWatchRv.
         WatchMetaItems items = parseWatchMetaItemsSemantically(leftWatchRv, res);
-        if (items == null || items.titleItem == null || items.actionsScroller == null) {
+        if (items == null || items.titleItem == null || items.actionsItem == null) {
             // Still binding metadata or user scrolled away; don't thrash existing host if same RV.
             if (state.hostView != null && state.leftWatchRvRef.get() != leftWatchRv) {
                 teardownWatchOverlay(state);
@@ -677,7 +750,7 @@ public final class YouTubeTabletWatchLayout {
         int relY = rvLoc[1] - contentLoc[1];
 
         // Hide immediately if leftWatchRv slid off-screen (minimizing to miniplayer or entering fullscreen).
-        if (relY < dpToPx(host.getResources(), 120) || relY > contentRoot.getHeight() - dpToPx(host.getResources(), 100)) {
+        if (relY < dpToPx(host.getResources(), 100) || relY > contentRoot.getHeight() - dpToPx(host.getResources(), 80)) {
             if (host.getVisibility() != View.GONE) {
                 host.setVisibility(View.GONE);
             }
@@ -779,7 +852,7 @@ public final class YouTubeTabletWatchLayout {
     }
 
     private static void collectVisibleRecyclerViews(View node, int depth, ArrayList<ViewGroup> out) {
-        if (node == null || depth > 14 || !node.isShown()) {
+        if (node == null || depth > 32 || !node.isShown()) {
             return;
         }
         if (HOST_TAG.equals(node.getTag())) {
@@ -801,33 +874,18 @@ public final class YouTubeTabletWatchLayout {
         View titleItem;
         View channelItem;
         View actionsItem;
-        ViewGroup actionsScroller;
-        View commentsTeaserItem; // Strictly verified to be Comments teaser (nullable).
+        ViewGroup actionsScroller; // Optional; may equal actionsItem (or inner scroller) on Litho bars.
+        View commentsTeaserItem;   // Strictly verified to be Comments teaser (nullable).
     }
 
     private static WatchMetaItems parseWatchMetaItemsSemantically(ViewGroup leftWatchRv, Resources res) {
-        int count = leftWatchRv.getChildCount();
-        if (count < 2) {
-            return null;
-        }
-        ArrayList<View> sorted = new ArrayList<>(count);
-        for (int i = 0; i < count; i++) {
-            View c = leftWatchRv.getChildAt(i);
-            if (c != null && c.getVisibility() == View.VISIBLE && c.getHeight() > dpToPx(res, 16)) {
-                sorted.add(c);
-            }
-        }
+        ArrayList<View> sorted = collectVerticalMetadataRows(leftWatchRv, res);
         if (sorted.size() < 2) {
             return null;
         }
-        Collections.sort(sorted, new Comparator<View>() {
-            @Override
-            public int compare(View a, View b) {
-                return Integer.compare(a.getTop(), b.getTop());
-            }
-        });
 
-        // 1. Anchor strictly on the horizontal action buttons scroller (Like/Dislike, Share, Ask, Save, Download...).
+        // 1. Identify the Actions row via EITHER a horizontal scroller OR semantic action keywords
+        //    ("share", "like", "dislike", "save", "download", "ask", "report") — works on ALL Litho versions!
         int actionsIdx = -1;
         ViewGroup actionsScroller = null;
         for (int i = 0; i < Math.min(sorted.size(), 6); i++) {
@@ -839,25 +897,37 @@ public final class YouTubeTabletWatchLayout {
                 break;
             }
         }
-        if (actionsIdx < 0 || actionsScroller == null) {
+        if (actionsIdx < 0) {
+            for (int i = 1; i < Math.min(sorted.size(), 6); i++) {
+                View item = sorted.get(i);
+                if (isSemanticActionButtonsRow(item, res)) {
+                    actionsIdx = i;
+                    actionsScroller = (item instanceof ViewGroup) ? (ViewGroup) item : null;
+                    break;
+                }
+            }
+        }
+        if (actionsIdx < 0) {
             return null;
         }
 
         WatchMetaItems out = new WatchMetaItems();
         out.actionsItem = sorted.get(actionsIdx);
-        out.actionsScroller = actionsScroller;
+        out.actionsScroller = actionsScroller != null
+                ? actionsScroller
+                : (out.actionsItem instanceof ViewGroup ? (ViewGroup) out.actionsItem : null);
         out.titleItem = sorted.get(0);
 
-        // 2. Identify the Channel row (the row immediately above actionsItem when actionsIdx >= 2).
+        // 2. Identify the Channel row (row immediately above actionsItem when actionsIdx >= 2,
+        //    or scan rows [1..actionsIdx-1] for channel/subscribe semantics).
         if (actionsIdx >= 2) {
             out.channelItem = sorted.get(actionsIdx - 1);
-        } else if (actionsIdx == 1) {
-            // Rare case: Title + Channel might be combined inside sorted.get(0); do not mis-slice.
+        } else {
             out.channelItem = null;
         }
 
         // 3. Strictly verify the Comments teaser below actionsItem — NEVER guess blindly!
-        for (int i = actionsIdx + 1; i < Math.min(sorted.size(), actionsIdx + 4); i++) {
+        for (int i = actionsIdx + 1; i < Math.min(sorted.size(), actionsIdx + 5); i++) {
             View candidate = sorted.get(i);
             if (isVerifiedCommentsTeaser(candidate)) {
                 out.commentsTeaserItem = candidate;
@@ -867,23 +937,82 @@ public final class YouTubeTabletWatchLayout {
         return out;
     }
 
+    private static ArrayList<View> collectVerticalMetadataRows(ViewGroup leftWatchRv, Resources res) {
+        int minH = dpToPx(res, 16);
+        ArrayList<View> sorted = new ArrayList<>(Math.max(4, leftWatchRv.getChildCount()));
+        int count = leftWatchRv.getChildCount();
+        for (int i = 0; i < count; i++) {
+            View c = leftWatchRv.getChildAt(i);
+            if (c != null && c.getVisibility() == View.VISIBLE && c.getHeight() > minH) {
+                sorted.add(c);
+            }
+        }
+        // If leftWatchRv wraps all metadata items inside a single outer container, unwrap one level.
+        if (sorted.size() == 1 && sorted.get(0) instanceof ViewGroup) {
+            ViewGroup single = (ViewGroup) sorted.get(0);
+            ArrayList<View> inner = new ArrayList<>(single.getChildCount());
+            for (int i = 0; i < single.getChildCount(); i++) {
+                View c = single.getChildAt(i);
+                if (c != null && c.getVisibility() == View.VISIBLE && c.getHeight() > minH) {
+                    inner.add(c);
+                }
+            }
+            if (inner.size() >= 2) {
+                sorted = inner;
+            }
+        }
+        Collections.sort(sorted, new Comparator<View>() {
+            @Override
+            public int compare(View a, View b) {
+                return Integer.compare(a.getTop(), b.getTop());
+            }
+        });
+        return sorted;
+    }
+
+    private static boolean isSemanticActionButtonsRow(View item, Resources res) {
+        if (item == null || !item.isShown()) {
+            return false;
+        }
+        int h = item.getHeight();
+        if (h < dpToPx(res, 24) || h > dpToPx(res, 110)) {
+            return false;
+        }
+        StringBuilder sb = new StringBuilder();
+        collectTextSnippet(item, 0, sb, 220);
+        String text = sb.toString().toLowerCase(Locale.US);
+        if (text.contains("comments") || text.contains("subscribe") || text.contains("unsubscribe")) {
+            return false;
+        }
+        int hits = 0;
+        if (text.contains("share")) hits++;
+        if (text.contains("like")) hits++;
+        if (text.contains("dislike")) hits++;
+        if (text.contains("save")) hits++;
+        if (text.contains("download")) hits++;
+        if (text.contains("report")) hits++;
+        if (text.contains("ask")) hits++;
+        if (text.contains("remix") || text.contains("clip") || text.contains("thanks")) hits++;
+        return hits >= 2;
+    }
+
     private static ViewGroup findHorizontalActionScroller(View node, Resources res, int depth) {
-        if (node == null || depth > 6 || !node.isShown()) {
+        if (node == null || depth > 10 || !node.isShown()) {
             return null;
         }
-        int minH = dpToPx(res, 26);
-        int maxH = dpToPx(res, 72);
+        int minH = dpToPx(res, 24);
+        int maxH = dpToPx(res, 96);
         if (node instanceof HorizontalScrollView) {
             int w = node.getWidth();
             int h = node.getHeight();
-            if (w > dpToPx(res, 180) && h >= minH && h <= maxH) {
+            if (w > dpToPx(res, 160) && h >= minH && h <= maxH) {
                 return (ViewGroup) node;
             }
         }
         if (node instanceof ViewGroup && isRecyclerView(node)) {
             int w = node.getWidth();
             int h = node.getHeight();
-            if (w > dpToPx(res, 180) && h >= minH && h <= maxH && w >= h * 3
+            if (w > dpToPx(res, 160) && h >= minH && h <= maxH && w >= h * 2
                     && ((ViewGroup) node).getChildCount() >= 2) {
                 return (ViewGroup) node;
             }
@@ -909,7 +1038,7 @@ public final class YouTubeTabletWatchLayout {
             return false;
         }
         StringBuilder sb = new StringBuilder();
-        collectTextSnippet(item, 0, sb, 160);
+        collectTextSnippet(item, 0, sb, 180);
         String text = sb.toString().toLowerCase(Locale.US);
         if (text.contains("subscribe") || text.contains("unsubscribe")) {
             return false;
@@ -926,24 +1055,57 @@ public final class YouTubeTabletWatchLayout {
     }
 
     private static void collectTextSnippet(View node, int depth, StringBuilder sb, int maxLen) {
-        if (node == null || depth > 5 || sb.length() >= maxLen) {
+        if (node == null || depth > 8 || sb.length() >= maxLen) {
             return;
         }
+        boolean foundDirect = false;
         if (node instanceof TextView) {
             CharSequence t = ((TextView) node).getText();
             if (t != null && t.length() > 0) {
                 sb.append(t, 0, Math.min(t.length(), maxLen - sb.length())).append(' ');
+                foundDirect = true;
             }
         }
         CharSequence cd = node.getContentDescription();
         if (cd != null && cd.length() > 0 && sb.length() < maxLen) {
             sb.append(cd, 0, Math.min(cd.length(), maxLen - sb.length())).append(' ');
+            foundDirect = true;
+        }
+        // Litho ComponentHost renders text via TextDrawable (not TextView); read AccessibilityNodeInfo fallback!
+        if (!foundDirect && sb.length() < maxLen) {
+            appendAccessibilityText(node, sb, maxLen);
         }
         if (node instanceof ViewGroup) {
             ViewGroup vg = (ViewGroup) node;
             int count = vg.getChildCount();
             for (int i = 0; i < count && sb.length() < maxLen; i++) {
                 collectTextSnippet(vg.getChildAt(i), depth + 1, sb, maxLen);
+            }
+        }
+    }
+
+    private static void appendAccessibilityText(View node, StringBuilder sb, int maxLen) {
+        AccessibilityNodeInfo info = null;
+        try {
+            info = node.createAccessibilityNodeInfo();
+            if (info == null) {
+                return;
+            }
+            CharSequence t = info.getText();
+            if (t != null && t.length() > 0 && sb.length() < maxLen) {
+                sb.append(t, 0, Math.min(t.length(), maxLen - sb.length())).append(' ');
+            }
+            CharSequence d = info.getContentDescription();
+            if (d != null && d.length() > 0 && sb.length() < maxLen) {
+                sb.append(d, 0, Math.min(d.length(), maxLen - sb.length())).append(' ');
+            }
+        } catch (Throwable ignored) {
+        } finally {
+            if (info != null) {
+                try {
+                    info.recycle();
+                } catch (Throwable ignored) {
+                }
             }
         }
     }
@@ -1375,17 +1537,12 @@ public final class YouTubeTabletWatchLayout {
     }
 
     private static boolean hasCommentsHeaderTitle(View node, int depth) {
-        if (node == null || depth > 5 || !node.isShown()) {
+        if (node == null || depth > 6 || !node.isShown()) {
             return false;
         }
-        if (node instanceof TextView) {
-            CharSequence txt = ((TextView) node).getText();
-            if (txt != null) {
-                String s = txt.toString().trim().toLowerCase(Locale.US);
-                if (s.equals("comments") || s.startsWith("comments ")) {
-                    return true;
-                }
-            }
+        String s = readSingleNodeLabel(node);
+        if (s.equals("comments") || s.startsWith("comments ")) {
+            return true;
         }
         if (node instanceof ViewGroup) {
             ViewGroup vg = (ViewGroup) node;
@@ -1400,17 +1557,14 @@ public final class YouTubeTabletWatchLayout {
     }
 
     private static boolean hasNonCommentsHeaderTitle(View node, int depth) {
-        if (node == null || depth > 4 || !node.isShown()) {
+        if (node == null || depth > 5 || !node.isShown()) {
             return false;
         }
-        if (node instanceof TextView) {
-            CharSequence txt = ((TextView) node).getText();
-            if (txt != null) {
-                String s = txt.toString().trim().toLowerCase(Locale.US);
-                for (int i = 0; i < NON_COMMENTS_PANEL_TITLES.length; i++) {
-                    if (s.equals(NON_COMMENTS_PANEL_TITLES[i])) {
-                        return true;
-                    }
+        String s = readSingleNodeLabel(node);
+        if (!s.isEmpty()) {
+            for (int i = 0; i < NON_COMMENTS_PANEL_TITLES.length; i++) {
+                if (s.equals(NON_COMMENTS_PANEL_TITLES[i])) {
+                    return true;
                 }
             }
         }
@@ -1424,6 +1578,22 @@ public final class YouTubeTabletWatchLayout {
             }
         }
         return false;
+    }
+
+    private static String readSingleNodeLabel(View node) {
+        if (node instanceof TextView) {
+            CharSequence txt = ((TextView) node).getText();
+            if (txt != null && txt.length() > 0) {
+                return txt.toString().trim().toLowerCase(Locale.US);
+            }
+        }
+        CharSequence cd = node.getContentDescription();
+        if (cd != null && cd.length() > 0) {
+            return cd.toString().trim().toLowerCase(Locale.US);
+        }
+        StringBuilder sb = new StringBuilder();
+        appendAccessibilityText(node, sb, 48);
+        return sb.toString().trim().toLowerCase(Locale.US);
     }
 
     private static boolean hasCommentResourceName(View node, int depth) {
@@ -1640,11 +1810,12 @@ public final class YouTubeTabletWatchLayout {
             if (btnLeft >= (int) (chW * 0.40f)) {
                 // Single right-side Subscribe/Bell button; left side of channelItem holds avatar + name + subs.
                 int leftContentRight = measureLeftSubtreeMaxRight(channelItem, channelItem, btnLeft, 0);
-                int pad = dpToPx(res, 10);
-                int clampedLeftRight = leftContentRight > dpToPx(res, 40)
+                int pad = dpToPx(res, 12);
+                int estimatedRight = estimateChannelLeftContentWidth(channelItem, res);
+                int targetLeftRight = leftContentRight > dpToPx(res, 40)
                         ? Math.min(btnLeft, leftContentRight + pad)
-                        : Math.min(btnLeft, dpToPx(res, 220));
-                result.add(new ViewCluster(channelItem, 0, Math.max(dpToPx(res, 80), clampedLeftRight), false));
+                        : Math.min(btnLeft, estimatedRight);
+                result.add(new ViewCluster(channelItem, 0, Math.max(dpToPx(res, 96), targetLeftRight), false));
                 result.add(new ViewCluster(btn, 0, btn.getWidth(), true));
                 return result;
             }
@@ -1785,18 +1956,38 @@ public final class YouTubeTabletWatchLayout {
         return best;
     }
 
+    private static int estimateChannelLeftContentWidth(View channelItem, Resources res) {
+        StringBuilder sb = new StringBuilder();
+        collectTextSnippet(channelItem, 0, sb, 64);
+        String raw = sb.toString()
+                .replaceAll("(?i)go to channel", "")
+                .replaceAll("(?i)subscribe.*", "")
+                .replaceAll("(?i)unsubscribe.*", "")
+                .replaceAll("(?i)current setting.*", "")
+                .replaceAll("(?i)notifications.*", "")
+                .trim();
+        if (raw.isEmpty()) {
+            return dpToPx(res, 210);
+        }
+        Paint measurePaint = new Paint();
+        measurePaint.setTextSize(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, 15f, res.getDisplayMetrics()));
+        float textW = measurePaint.measureText(raw);
+        // Avatar (36dp) + left/right padding & spacing (40dp) + measured channel name & subscriber count.
+        return Math.min(dpToPx(res, 320), Math.max(dpToPx(res, 140), dpToPx(res, 76) + Math.round(textW)));
+    }
+
     /**
      * Extracts each individual action pill View (Like/Dislike, Share, Ask, Save, Download, Report...)
-     * directly from YouTube's horizontal action scroller — every pill renders at 100% full width.
+     * directly from YouTube's horizontal action scroller or Litho action row — every pill renders at 100% full width.
      */
-    private static ArrayList<View> extractActionPillViews(ViewGroup actionScroller, Resources res) {
+    private static ArrayList<View> extractActionPillViews(View actionContainer, Resources res) {
         ArrayList<View> pills = new ArrayList<>(8);
-        if (actionScroller == null) {
+        if (!(actionContainer instanceof ViewGroup)) {
             return pills;
         }
-        ViewGroup host = actionScroller;
+        ViewGroup host = (ViewGroup) actionContainer;
         // Unwrap single-child wrappers (e.g. HorizontalScrollView -> LinearLayout / LithoView).
-        for (int unwrap = 0; unwrap < 3; unwrap++) {
+        for (int unwrap = 0; unwrap < 6; unwrap++) {
             if (host.getChildCount() == 1 && host.getChildAt(0) instanceof ViewGroup) {
                 host = (ViewGroup) host.getChildAt(0);
             } else {
@@ -1814,10 +2005,16 @@ public final class YouTubeTabletWatchLayout {
                 pills.add(child);
             }
         }
+        if (pills.size() < 2) {
+            // Litho fallback: find outermost non-full-width clickable pill nodes arranged horizontally.
+            pills.clear();
+            int rootW = Math.max(1, actionContainer.getWidth());
+            collectNonFullWidthClickables(actionContainer, actionContainer, rootW, res, 0, pills);
+        }
         Collections.sort(pills, new Comparator<View>() {
             @Override
             public int compare(View a, View b) {
-                return Integer.compare(a.getLeft(), b.getLeft());
+                return Integer.compare(getRelativeLeft(a, actionContainer), getRelativeLeft(b, actionContainer));
             }
         });
         return pills;
@@ -2000,7 +2197,8 @@ public final class YouTubeTabletWatchLayout {
             }
 
             // 3. Action pills (Like/Dislike -> NEW Comment pill -> Share, Ask, Save, Download, Report...).
-            ArrayList<View> pills = extractActionPillViews(items.actionsScroller, res);
+            View actionSource = items.actionsScroller != null ? items.actionsScroller : items.actionsItem;
+            ArrayList<View> pills = extractActionPillViews(actionSource, res);
             if (pills.size() >= 2) {
                 for (int i = 0; i < pills.size(); i++) {
                     View pill = pills.get(i);
@@ -2015,18 +2213,18 @@ public final class YouTubeTabletWatchLayout {
                         addCommentPill(ctx, res, onCommentClick, gapPx);
                     }
                 }
-            } else {
+            } else if (actionSource != null) {
                 // Flattened Litho strip: place Comment pill right before the full-width inner action strip
                 // (never clip to HorizontalScrollView's narrower viewport width!).
                 addCommentPill(ctx, res, onCommentClick, gapPx);
-                View fullActionStrip = items.actionsScroller;
-                if (items.actionsScroller instanceof HorizontalScrollView
-                        && items.actionsScroller.getChildCount() > 0) {
-                    View inner = items.actionsScroller.getChildAt(0);
-                    if (inner != null && inner.getWidth() >= items.actionsScroller.getWidth()) {
+                View fullActionStrip = actionSource;
+                if (actionSource instanceof HorizontalScrollView
+                        && ((ViewGroup) actionSource).getChildCount() > 0) {
+                    View inner = ((ViewGroup) actionSource).getChildAt(0);
+                    if (inner != null && inner.getWidth() >= actionSource.getWidth()) {
                         fullActionStrip = inner;
                     }
-                } else if (pills.size() == 1 && pills.get(0).getWidth() >= items.actionsScroller.getWidth() * 0.7f) {
+                } else if (pills.size() == 1 && pills.get(0).getWidth() >= actionSource.getWidth() * 0.7f) {
                     fullActionStrip = pills.get(0);
                 }
                 int aw = Math.max(1, fullActionStrip.getWidth());
@@ -2034,6 +2232,8 @@ public final class YouTubeTabletWatchLayout {
                 LiveViewSlot slot = new LiveViewSlot(ctx, fullActionStrip, 0, aw, true);
                 liveSlots.add(slot);
                 addMergedChild(slot, aw, ah, gapPx);
+            } else {
+                addCommentPill(ctx, res, onCommentClick, gapPx);
             }
 
             // Show comments teaser placeholder cleanly inside commentsBodyContainer until live panel docks.
@@ -2372,12 +2572,14 @@ public final class YouTubeTabletWatchLayout {
             if (target == null || !target.isAttachedToWindow()) {
                 return false;
             }
-            int tw = Math.max(1, target.getWidth());
             int th = Math.max(1, target.getHeight());
             float offsetY = (th < getHeight()) ? (getHeight() - th) * 0.5f : 0f;
 
-            float mappedX = Math.max(1f, Math.min(tw - 1f, event.getX() + cropLeft));
-            float mappedY = Math.max(1f, Math.min(th - 1f, event.getY() - offsetY));
+            float mappedX = event.getX() + cropLeft;
+            float mappedY = event.getY() - offsetY;
+            if (event.getY() >= 0f && event.getY() <= getHeight()) {
+                mappedY = Math.max(1f, Math.min(th - 1f, mappedY));
+            }
 
             MotionEvent copy = MotionEvent.obtain(event);
             copy.setLocation(mappedX, mappedY);
@@ -2585,7 +2787,18 @@ public final class YouTubeTabletWatchLayout {
     }
 
     private static boolean isRecyclerView(View v) {
-        return v != null && v.getClass().getName().contains("RecyclerView");
+        if (v == null) {
+            return false;
+        }
+        Class<?> cls = v.getClass();
+        for (int depth = 0; depth < 6 && cls != null && cls != ViewGroup.class && cls != Object.class; depth++) {
+            String name = cls.getName();
+            if (name.contains("RecyclerView")) {
+                return true;
+            }
+            cls = cls.getSuperclass();
+        }
+        return false;
     }
 
     private static boolean isInsideOurHost(View v) {
